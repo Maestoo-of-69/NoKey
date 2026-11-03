@@ -8,3 +8,9 @@
 config.json
 token.bin
 *.env
+
+# Editor and OS files
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
