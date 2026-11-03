@@ -9,7 +9,35 @@ folder or a website — or several of these in a row.
 - Event-driven: no polling, no idle timers, no background network.
 - 5 themes, 4 interface languages (including Hebrew right-to-left).
 
-First-time Discord setup: see [SETUP.md](SETUP.md).
+## Download
+
+**[⬇ Download NoKey.exe](https://github.com/Maestoo-of-69/NoKey/releases/latest/download/NoKey.exe)**
+(Windows 10/11, 64-bit) · [all releases](https://github.com/Maestoo-of-69/NoKey/releases)
+
+1. Download `NoKey.exe` and put it in any folder, e.g. `C:\Tools\NoKey\`.
+   No installer: the exe is the whole program.
+2. Double-click it. The exe is not code-signed, so Windows may warn you:
+   - **SmartScreen** ("Windows protected your PC"): click **More info →
+     Run anyway**.
+   - **Smart App Control** may block it with no "Run anyway" button. Then
+     NoKey can only be run by building it yourself (see
+     [Build and test](#build-and-test)) or with Smart App Control turned off.
+3. NoKey starts in the system tray (the `^` area next to the clock).
+   Double-click the icon to open the main window, then **+ New binding**:
+   record a shortcut, pick an action, save.
+4. Discord pings need a bot first: see [SETUP.md](SETUP.md).
+
+Optional — check the download is intact (PowerShell, in the download folder;
+compare with
+[`NoKey.exe.sha256`](https://github.com/Maestoo-of-69/NoKey/releases/latest/download/NoKey.exe.sha256)):
+
+```powershell
+(Get-FileHash .\NoKey.exe -Algorithm SHA256).Hash
+```
+
+To update later: Settings → Updates → **Check for updates**. To remove:
+right-click the tray icon → **Exit**, then delete the exe and the
+`%APPDATA%\NoKey` folder.
 
 ## Features
 
