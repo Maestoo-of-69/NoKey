@@ -1,0 +1,10 @@
+# Build output
+/target/
+
+# Local portable build; release binaries are published as GitHub Release assets
+/Release/
+
+# Never commit settings or tokens (NoKey keeps them in %APPDATA%\NoKey anyway)
+config.json
+token.bin
+*.env
