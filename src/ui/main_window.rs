@@ -16,6 +16,18 @@ const W: i32 = 560;
 const H: i32 = 666;
 const ROW_H: i32 = 44;
 const HEADER_H: i32 = 52;
+/// Taller header for themes with a Star of David, so the star can be large.
+const STAR_HEADER_H: i32 = 96;
+
+/// Header height for the current theme.
+fn header_h() -> i32 {
+    if palette().star.is_some() { STAR_HEADER_H } else { HEADER_H }
+}
+
+/// How far everything below the header moves down in the current theme.
+fn body_shift() -> i32 {
+    header_h() - HEADER_H
+}
 
 const ID_LIST: i32 = 100;
 const ID_NEW: i32 = 101;
@@ -115,7 +127,7 @@ pub fn register(icon: HICON) {
 }
 
 pub fn create() {
-    create_window(CLASS, "NoKey", W, H, null_mut());
+    create_window(CLASS, "NoKey", W, H + body_shift(), null_mut());
     refresh();
 }
 
@@ -357,20 +369,22 @@ pub fn flash(id: u32, ok: bool) {
 }
 
 fn on_create(hwnd: HWND) {
+    // y values below are for the standard header; `dy` moves them under a taller one.
+    let dy = body_shift();
     let b = |id, text: &str, kind, x, y, w, h| {
         let btn = button(hwnd, id, text, kind);
-        place(btn, x, y, w, h);
+        place(btn, x, y + dy, w, h);
         btn
     };
-    let btn_settings = b(ID_SETTINGS, &t("main.settings"), BTN_SECONDARY, W - 24 - 120, 12, 120, 30);
+    let btn_settings = b(ID_SETTINGS, &t("main.settings"), BTN_SECONDARY, W - 24 - 120, 12 - dy / 2, 120, 30);
     let btn_disable_all = b(ID_DISABLE_ALL, &t("main.disable_all"), BTN_BIG, 24, 60, W - 48, 48);
     let btn_profile = b(ID_PROFILE, "", BTN_DROPDOWN, 24, 136, 170, 32);
     let search = edit(hwnd, ID_SEARCH, 0);
-    place(search, 212, 142, 196, 20);
+    place(search, 212, 142 + dy, 196, 20);
     set_cue(search, &t("main.search"));
     let btn_sort = b(ID_SORT, "", BTN_DROPDOWN, 426, 136, 110, 32);
     let list = listbox(hwnd, ID_LIST, 0);
-    place(list, 24, 202, W - 48, 4 * ROW_H);
+    place(list, 24, 202 + dy, W - 48, 4 * ROW_H);
     b(ID_NEW, &t("main.new"), BTN_PRIMARY, 24, 388, 160, 32);
     let btn_edit = b(ID_EDIT, &t("main.edit"), BTN_SECONDARY, 192, 388, 110, 32);
     let btn_more = b(ID_MORE, &t("main.more"), BTN_DROPDOWN, 310, 388, 140, 32);
@@ -432,16 +446,22 @@ fn on_paint(hwnd: HWND) {
     paint(hwnd, |hdc, _| {
         let p = palette();
         let f = fonts();
-        header_band(hdc, W, HEADER_H);
-        text(hdc, "NoKey", &r(24, 10, 200, 34), f.title, p.text, DT_SINGLELINE | DT_VCENTER);
+        let (hh, dy) = (header_h(), body_shift());
+        header_band(hdc, W, hh);
+        text(hdc, "NoKey", &r(24, 10 + dy / 2, 200, 34), f.title, p.text, DT_SINGLELINE | DT_VCENTER);
+        if let Some(star) = p.star {
+            let size = px(hh - 18);
+            let cx = px(24 + 18) + text_width(hdc, "NoKey", f.title) + size / 2;
+            star_of_david(hdc, cx, px(hh / 2), size, star, p.bg);
+        }
 
         // Discord connection, right-aligned before the Settings button
         let right = px(W - 24 - 120 - 14);
         let tw = text_width(hdc, &v.conn_short, f.small);
-        let tr = RECT { left: right - tw, top: px(12), right, bottom: px(42) };
+        let tr = RECT { left: right - tw, top: px(12 + dy / 2), right, bottom: px(42 + dy / 2) };
         let color = if v.connected { p.text } else { p.muted };
         text(hdc, &v.conn_short, &tr, f.small, color, DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
-        dot(hdc, tr.left - px(12), px(27), v.connected);
+        dot(hdc, tr.left - px(12), px(27 + dy / 2), v.connected);
 
         let status = match (&v.emergency_error, v.all_enabled) {
             (Some(e), _) => format!("⚠ {e}"),
@@ -449,45 +469,45 @@ fn on_paint(hwnd: HWND) {
             (None, false) => t("main.status_disabled"),
         };
         let status_color = if v.all_enabled { p.muted } else { p.text };
-        text(hdc, &status, &r(24, 112, W - 48, 18), f.small, status_color, DT_SINGLELINE | DT_CENTER | DT_END_ELLIPSIS);
+        text(hdc, &status, &r(24, 112 + dy, W - 48, 18), f.small, status_color, DT_SINGLELINE | DT_CENTER | DT_END_ELLIPSIS);
 
         edit_frames(hwnd, hdc, &[search]);
-        caption(hdc, &t("main.bindings"), 24, 182, 260);
+        caption(hdc, &t("main.bindings"), 24, 182 + dy, 260);
         let count = tf("main.active_count", &[("count", &v.total.to_string())]);
-        text(hdc, &count, &r(W - 224, 182, 200, 18), f.small, p.muted, DT_SINGLELINE | DT_RIGHT);
+        text(hdc, &count, &r(W - 224, 182 + dy, 200, 18), f.small, p.muted, DT_SINGLELINE | DT_RIGHT);
         if v.rows.is_empty() {
-            let area = r(24, 202, W - 48, 4 * ROW_H);
+            let area = r(24, 202 + dy, W - 48, 4 * ROW_H);
             round_rect(hdc, &area, p.line, None, 10);
             let empty = if crate::win::get_text(search).trim().is_empty() { t("main.empty") } else { t("main.nothing_found") };
             text(hdc, &empty, &area, f.normal, p.muted, DT_CENTER | DT_VCENTER | DT_WORDBREAK);
         }
 
-        hline(hdc, 24, 432, W - 48);
-        caption(hdc, &t("main.selected"), 24, 442, 300);
+        hline(hdc, 24, 432 + dy, W - 48);
+        caption(hdc, &t("main.selected"), 24, 442 + dy, 300);
         if v.run_label.is_none() {
-            text(hdc, &t("main.nothing_selected"), &r(24, 462, W - 48, 20), f.normal, p.muted, DT_SINGLELINE);
+            text(hdc, &t("main.nothing_selected"), &r(24, 462 + dy, W - 48, 20), f.normal, p.muted, DT_SINGLELINE);
         }
         for (i, line) in v.detail.iter().enumerate() {
             let font = if i == 0 { f.normal } else { f.small };
             let color = if i == 0 { p.text } else { p.muted };
-            text(hdc, line, &r(24, 462 + 20 * i as i32, W - 48, 20), font, color, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            text(hdc, line, &r(24, 462 + dy + 20 * i as i32, W - 48, 20), font, color, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
         }
 
-        hline(hdc, 24, 572, W - 48);
-        caption(hdc, &t("main.status"), 24, 582, 300);
+        hline(hdc, 24, 572 + dy, W - 48);
+        caption(hdc, &t("main.status"), 24, 582 + dy, 300);
         // The value column starts after the longest label (labels differ a lot between languages).
         let (ping_label, result_label) = (t("main.last_ping"), t("main.result"));
         let label_w = text_width(hdc, &ping_label, f.small).max(text_width(hdc, &result_label, f.small));
         let vx = (px(24) + label_w + px(16)).max(px(134));
         let value = |y: i32, h: i32| RECT { left: vx, top: px(y), right: px(W - 24), bottom: px(y + h) };
-        text(hdc, &ping_label, &r(24, 602, W - 48, 20), f.small, p.muted, DT_SINGLELINE | DT_VCENTER);
-        text(hdc, &v.last_ping, &value(602, 20), f.normal, p.text, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        text(hdc, &ping_label, &r(24, 602 + dy, W - 48, 20), f.small, p.muted, DT_SINGLELINE | DT_VCENTER);
+        text(hdc, &v.last_ping, &value(602 + dy, 20), f.normal, p.text, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
         let result = match &v.last_result {
             Some((ok, msg)) => format!("{} {msg}", if *ok { "✓" } else { "✕" }),
             None => t("main.ready"),
         };
-        text(hdc, &result_label, &r(24, 622, W - 48, 20), f.small, p.muted, DT_SINGLELINE | DT_VCENTER);
-        text(hdc, &result, &value(622, 40), f.normal, p.text, DT_WORDBREAK | DT_END_ELLIPSIS);
+        text(hdc, &result_label, &r(24, 622 + dy, W - 48, 20), f.small, p.muted, DT_SINGLELINE | DT_VCENTER);
+        text(hdc, &result, &value(622 + dy, 40), f.normal, p.text, DT_WORDBREAK | DT_END_ELLIPSIS);
     });
 }
 

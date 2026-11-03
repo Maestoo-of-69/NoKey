@@ -32,6 +32,8 @@ pub struct Palette {
     pub warn_text: COLORREF,
     /// Decorative header pattern (Jewish theme only).
     pub pattern: Option<COLORREF>,
+    /// Star of David in the main window header (Jewish theme only).
+    pub star: Option<COLORREF>,
     /// Dark title bar.
     pub dark: bool,
 }
@@ -49,6 +51,7 @@ pub const DARK: Palette = Palette {
     warn: rgb(0xE5, 0xE5, 0xE5),
     warn_text: rgb(0, 0, 0),
     pattern: None,
+    star: None,
     dark: true,
 };
 
@@ -65,6 +68,7 @@ pub const LIGHT: Palette = Palette {
     warn: rgb(0x17, 0x17, 0x17),
     warn_text: rgb(0xFF, 0xFF, 0xFF),
     pattern: None,
+    star: None,
     dark: false,
 };
 
@@ -82,23 +86,26 @@ pub const CONTRAST: Palette = Palette {
     warn: rgb(0xFF, 0xD4, 0x00),
     warn_text: rgb(0, 0, 0),
     pattern: None,
+    star: None,
     dark: true,
 };
 
-/// Blue and white with a light geometric lattice in the header.
+/// Saturated flag blue on white: blue header stripes, a geometric lattice
+/// and a large Star of David in the main window header.
 pub const JEWISH: Palette = Palette {
-    bg: rgb(0xFF, 0xFF, 0xFF),
-    surface: rgb(0xEE, 0xF3, 0xFC),
-    selected: rgb(0xD6, 0xE2, 0xF8),
-    text: rgb(0x0B, 0x1F, 0x4D),
-    muted: rgb(0x4A, 0x5D, 0x8A),
+    bg: rgb(0xF5, 0xF8, 0xFF),
+    surface: rgb(0xE3, 0xEC, 0xFF),
+    selected: rgb(0xC7, 0xD8, 0xFF),
+    text: rgb(0x0A, 0x1A, 0x47),
+    muted: rgb(0x2E, 0x4A, 0x8C),
     border: rgb(0x00, 0x38, 0xB8),
-    line: rgb(0xC9, 0xD6, 0xF2),
+    line: rgb(0xB9, 0xCC, 0xF5),
     accent: rgb(0x00, 0x38, 0xB8),
     accent_text: rgb(0xFF, 0xFF, 0xFF),
-    warn: rgb(0x0B, 0x1F, 0x4D),
+    warn: rgb(0x0A, 0x1A, 0x47),
     warn_text: rgb(0xFF, 0xFF, 0xFF),
-    pattern: Some(rgb(0xD3, 0xDF, 0xF6)),
+    pattern: Some(rgb(0xBF, 0xD1, 0xFA)),
+    star: Some(rgb(0x00, 0x38, 0xB8)),
     dark: false,
 };
 
@@ -218,6 +225,7 @@ mod tests {
             assert!(contrast(p.muted, p.bg) >= 4.0, "{name}: muted text");
         }
         assert!(contrast(CONTRAST.accent, CONTRAST.bg) >= 12.0, "contrast theme accent");
+        assert!(contrast(JEWISH.star.unwrap(), JEWISH.bg) >= 7.0, "jewish theme star");
     }
 
     #[test]

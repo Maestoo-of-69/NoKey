@@ -383,7 +383,7 @@ pub fn caption(hdc: HDC, s: &str, x: i32, y: i32, w: i32) {
     text(hdc, &s.to_uppercase(), &r(x, y, w, 18), fonts().small, palette().muted, DT_SINGLELINE | DT_LEFT);
 }
 
-/// Window header background. The Jewish theme adds a light lattice of
+/// Window header background. The Jewish theme adds a lattice of
 /// interlocking triangles and blue stripes; other themes are plain.
 pub fn header_band(hdc: HDC, width: i32, height: i32) {
     let p = palette();
@@ -416,8 +416,39 @@ pub fn header_band(hdc: HDC, width: i32, height: i32) {
         DeleteObject(pen as _);
         RestoreDC(hdc, saved);
     }
-    fill(hdc, &RECT { left: 0, top: 0, right: px(width), bottom: px(4) }, p.accent);
-    fill(hdc, &RECT { left: 0, top: px(height) - px(2), right: px(width), bottom: px(height) }, p.accent);
+    fill(hdc, &RECT { left: 0, top: 0, right: px(width), bottom: px(5) }, p.accent);
+    fill(hdc, &RECT { left: 0, top: px(height) - px(5), right: px(width), bottom: px(height) }, p.accent);
+}
+
+/// Star of David centered at (cx, cy), `size` tall (device pixels): two
+/// interlaced outlined triangles. The inside is filled with `fill_color` so
+/// the header lattice does not show through.
+pub fn star_of_david(hdc: HDC, cx: i32, cy: i32, size: i32, color: COLORREF, fill_color: COLORREF) {
+    let radius = size as f32 / 2.0;
+    let triangle = |start_deg: f32| -> [POINT; 3] {
+        std::array::from_fn(|i| {
+            let a = (start_deg + 120.0 * i as f32).to_radians();
+            POINT { x: cx + (radius * a.cos()).round() as i32, y: cy + (radius * a.sin()).round() as i32 }
+        })
+    };
+    let (up, down) = (triangle(-90.0), triangle(90.0));
+    unsafe {
+        // Fill both first, then outline both, so neither fill covers an outline.
+        let brush = CreateSolidBrush(fill_color);
+        let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+        let old_brush = SelectObject(hdc, brush as _);
+        Polygon(hdc, up.as_ptr(), 3);
+        Polygon(hdc, down.as_ptr(), 3);
+        let pen = CreatePen(PS_SOLID, (size / 13).max(2), color);
+        SelectObject(hdc, pen as _);
+        SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        Polygon(hdc, up.as_ptr(), 3);
+        Polygon(hdc, down.as_ptr(), 3);
+        SelectObject(hdc, old_pen);
+        SelectObject(hdc, old_brush);
+        DeleteObject(pen as _);
+        DeleteObject(brush as _);
+    }
 }
 
 /// Draws the frame around each visible edit box (accent when focused).

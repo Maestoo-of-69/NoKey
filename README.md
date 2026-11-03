@@ -98,7 +98,7 @@ separate "Hold" mode: no action has a state that could be held.
 ### Interface
 
 - Themes: Dark, Light, Contrast, System (follows Windows light/dark live),
-  Jewish (blue and white, light geometric lattice in headers). Instant.
+  Jewish (saturated blue and white, geometric lattice in headers, large Star of David in the main header). Instant.
 - Languages: Русский, English, עברית (right-to-left mirrored layout),
   Язык боли (a joke Russian translation). Instant; windows are re-created.
 - Search, sort, "show all profiles", More menu / right-click (duplicate,

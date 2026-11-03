@@ -925,8 +925,14 @@ pub fn set_theme(theme: Theme) -> Result<(), String> {
         next.theme = theme;
         a.commit(next)
     })?;
+    let had_star = ui::theme::palette().star.is_some();
     ui::theme::set_theme(theme);
-    ui::repaint_all();
+    if ui::theme::palette().star.is_some() != had_star {
+        // The main window header changes height: lay the windows out again.
+        ui::rebuild_all();
+    } else {
+        ui::repaint_all();
+    }
     Ok(())
 }
 
