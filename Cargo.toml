@@ -1,6 +1,6 @@
 [package]
 name = "nokey"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Lightweight native Windows hotkey manager with a built-in Discord mention action"
 build = "build.rs"

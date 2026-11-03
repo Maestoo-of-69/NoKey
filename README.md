@@ -11,8 +11,8 @@ folder or a website — or several of these in a row.
 
 ## Download
 
-**[⬇ Download NoKey.exe](https://github.com/Maestoo-of-69/NoKey/releases/latest/download/NoKey.exe)**
-(Windows 10/11, 64-bit) · [all releases](https://github.com/Maestoo-of-69/NoKey/releases)
+**[⬇ Download NoKey.exe — v0.2.1](https://github.com/Maestoo-of-69/NoKey/releases/latest/download/NoKey.exe)**
+(Windows 10/11, 64-bit) · [what's new in v0.2.1](https://github.com/Maestoo-of-69/NoKey/releases/tag/v0.2.1) · [all releases](https://github.com/Maestoo-of-69/NoKey/releases)
 
 1. Download `NoKey.exe` and put it in any folder, e.g. `C:\Tools\NoKey\`.
    No installer: the exe is the whole program.
