@@ -2,7 +2,7 @@
 //! Only the action types in `config::Action` exist — there is no way to
 //! run arbitrary commands.
 
-use crate::config::{Action, ActionKind};
+use crate::config::{internet_shortcut_url, is_shortcut_url_allowed, Action, ActionKind};
 use crate::discord::api::{ApiError, Client};
 use crate::win::shell::{self, ShellFail};
 use std::time::Duration;
@@ -56,10 +56,23 @@ fn run_one(action: &Action, client: Option<&Client>) -> (Result<(), StepError>, 
                 Err(e) => (Err(StepError::Discord(e)), None),
             }
         }
+        Action::OpenApp { path, .. } if path.trim().to_ascii_lowercase().ends_with(".url") => {
+            (open_internet_shortcut(path.trim()), None)
+        }
         Action::OpenApp { path, args } => (shell::open_existing_file(path, args).map_err(StepError::Shell), None),
         Action::OpenFile { path } => (shell::open_existing_file(path, "").map_err(StepError::Shell), None),
         Action::OpenFolder { path } => (shell::open_folder(path).map_err(StepError::Shell), None),
         Action::OpenUrl { url } => (shell::open(url.trim(), "").map_err(StepError::Shell), None),
+    }
+}
+
+/// Opens the link inside a .url file (e.g. `steam://rungameid/570`) rather
+/// than the file itself, so exactly the checked URL is opened.
+fn open_internet_shortcut(path: &str) -> Result<(), StepError> {
+    let bytes = std::fs::read(path).map_err(|_| StepError::Shell(ShellFail::FileNotFound))?;
+    match internet_shortcut_url(&String::from_utf8_lossy(&bytes)) {
+        Some(url) if is_shortcut_url_allowed(&url) => shell::open(&url, "").map_err(StepError::Shell),
+        _ => Err(StepError::Invalid("err.url_shortcut")),
     }
 }
 
@@ -128,6 +141,21 @@ mod tests {
         };
         let r = run(&[ping], 0, true, None);
         assert_eq!(r.outcomes[0].result, Err(StepError::NoToken));
+    }
+
+    #[test]
+    fn url_shortcut_to_a_local_file_is_refused() {
+        let dir = std::env::temp_dir().join(format!("nokey-url-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("evil.url");
+        std::fs::write(&path, "[InternetShortcut]\r\nURL=file:///C:/Windows/System32/cmd.exe\r\n").unwrap();
+        let app = Action::OpenApp { path: path.to_string_lossy().into_owned(), args: String::new() };
+        let r = run(&[app], 0, true, None);
+        assert_eq!(r.outcomes[0].result, Err(StepError::Invalid("err.url_shortcut")));
+        let missing = Action::OpenApp { path: dir.join("missing.url").to_string_lossy().into_owned(), args: String::new() };
+        let r = run(&[missing], 0, true, None);
+        assert_eq!(r.outcomes[0].result, Err(StepError::Shell(ShellFail::FileNotFound)));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

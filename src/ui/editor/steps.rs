@@ -425,7 +425,7 @@ fn field_button(i: usize) {
             lookup_started(2, app::discord_lookup(move |c| TaskResult::UserInfo(c.user(&user))));
         }
         (ActionKind::OpenApp, 0) => {
-            if let Some(p) = shell::pick_file(hwnd, &[(&t("field.programs_filter"), "*.exe;*.lnk")]) {
+            if let Some(p) = shell::pick_file(hwnd, &[(&t("field.programs_filter"), "*.exe;*.lnk;*.url")]) {
                 set_text(fields[0], &p);
             }
         }

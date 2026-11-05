@@ -134,7 +134,7 @@ impl Action {
                 if lower.is_empty() {
                     return Err("err.choose_app");
                 }
-                if !(lower.ends_with(".exe") || lower.ends_with(".lnk")) {
+                if ![".exe", ".lnk", ".url"].iter().any(|ext| lower.ends_with(ext)) {
                     return Err("err.app_type");
                 }
                 if BLOCKED_PROGRAMS.contains(&file_name(&lower).as_str()) {
@@ -173,6 +173,40 @@ pub fn is_web_url(url: &str) -> bool {
         }
         None => false,
     }
+}
+
+/// URL schemes an internet shortcut (.url) may not open: local files (could be
+/// a script), script URLs, and Windows protocols known to be abused.
+const BLOCKED_SCHEMES: [&str; 12] = [
+    "file", "javascript", "vbscript", "data", "shell", "search", "search-ms", "ms-msdt", "ms-appinstaller",
+    "ms-officecmd", "mk", "ms-its",
+];
+
+/// The `URL=` value of an internet shortcut's `[InternetShortcut]` section.
+pub fn internet_shortcut_url(text: &str) -> Option<String> {
+    let mut in_section = false;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_section = line.eq_ignore_ascii_case("[InternetShortcut]");
+        } else if in_section && line.len() > 4 && line[..4].eq_ignore_ascii_case("url=") {
+            return Some(line[4..].trim().to_string());
+        }
+    }
+    None
+}
+
+/// A shortcut URL NoKey will open: a protocol link such as `steam://…` or a
+/// website, never a local file, a script URL or a blocked Windows protocol.
+pub fn is_shortcut_url_allowed(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once(':') else { return false };
+    let scheme = scheme.to_ascii_lowercase();
+    // One letter would be a drive ("C:\…"), i.e. a local file.
+    scheme.len() >= 2
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+        && !BLOCKED_SCHEMES.contains(&scheme.as_str())
+        && !rest.is_empty()
+        && !url.chars().any(|c| c.is_control() || c == '"')
 }
 
 /// Extensions that would run code (or follow a link to code) if "opened".
@@ -626,6 +660,32 @@ mod tests {
         assert!(app(r"C:\a\tool.bat").is_err());
         assert!(app(r"C:\Windows\System32\cmd.exe").is_err());
         assert!(app(r"C:\Windows\System32\WindowsPowerShell\v1.0\POWERSHELL.EXE").is_err());
+        assert!(app(r"C:\Start Menu\Steam\Dota 2.url").is_ok());
+        assert!(file(r"C:\Start Menu\Steam\Dota 2.url").is_err(), "Open File still refuses shortcuts");
+    }
+
+    #[test]
+    fn reads_internet_shortcut_url() {
+        let steam = "[{000214A0-0000-0000-C000-000000000046}]\r\nProp3=19,0\r\n[InternetShortcut]\r\nIDList=\r\n\
+                     IconIndex=0\r\nURL=steam://rungameid/570\r\nIconFile=C:\\x.ico\r\n";
+        assert_eq!(internet_shortcut_url(steam).as_deref(), Some("steam://rungameid/570"));
+        assert_eq!(internet_shortcut_url("[Other]\nURL=https://a.b\n"), None, "URL outside the section is ignored");
+        assert_eq!(internet_shortcut_url("[InternetShortcut]\nIconIndex=0\n"), None);
+    }
+
+    #[test]
+    fn shortcut_url_schemes() {
+        assert!(is_shortcut_url_allowed("steam://rungameid/570"));
+        assert!(is_shortcut_url_allowed("com.epicgames.launcher://apps/x?action=launch"));
+        assert!(is_shortcut_url_allowed("https://example.com"));
+        assert!(!is_shortcut_url_allowed("file:///C:/x/run.bat"));
+        assert!(!is_shortcut_url_allowed("FILE:///C:/x/run.bat"));
+        assert!(!is_shortcut_url_allowed(r"C:\x\run.bat"));
+        assert!(!is_shortcut_url_allowed("javascript:alert(1)"));
+        assert!(!is_shortcut_url_allowed("search-ms:query=x"));
+        assert!(!is_shortcut_url_allowed("ms-msdt:/id x"));
+        assert!(!is_shortcut_url_allowed("steam:"));
+        assert!(!is_shortcut_url_allowed("no-scheme"));
     }
 
     #[test]

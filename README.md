@@ -11,8 +11,8 @@ folder or a website — or several of these in a row.
 
 ## Download
 
-**[⬇ Download NoKey.exe — v0.2.1](https://github.com/Maestoo-of-69/NoKey/releases/latest/download/NoKey.exe)**
-(Windows 10/11, 64-bit) · [what's new in v0.2.1](https://github.com/Maestoo-of-69/NoKey/releases/tag/v0.2.1) · [all releases](https://github.com/Maestoo-of-69/NoKey/releases)
+**[⬇ Download NoKey.exe — v0.2.2](https://github.com/Maestoo-of-69/NoKey/releases/latest/download/NoKey.exe)**
+(Windows 10/11, 64-bit) · [what's new in v0.2.2](https://github.com/Maestoo-of-69/NoKey/releases/tag/v0.2.2) · [all releases](https://github.com/Maestoo-of-69/NoKey/releases)
 
 1. Download `NoKey.exe` and put it in any folder, e.g. `C:\Tools\NoKey\`.
    No installer: the exe is the whole program.
@@ -75,7 +75,7 @@ separate "Hold" mode: no action has a state that could be held.
 
 - **Discord Ping** — one message `<@USER_ID>`; only that user is pinged
   (`allowed_mentions.users`), never `@everyone`, `@here` or roles.
-- **Open Application** — `.exe`/`.lnk`; command shells and script hosts are refused.
+- **Open Application** — `.exe`/`.lnk`, or a game/app shortcut `.url` (e.g. Steam's `steam://rungameid/570`; its link is opened, `file:` and script links are refused); command shells and script hosts are refused.
 - **Open File** (programs, scripts and shortcuts refused), **Open Folder**.
 - **Open URL in Default Browser** — `http(s)://` only, via `ShellExecuteW`;
   new tab vs. window is decided by the browser.
