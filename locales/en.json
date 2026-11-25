@@ -96,7 +96,7 @@
   "err.choose_app": "Choose an application.",
   "err.choose_file": "Choose a file.",
   "err.choose_folder": "Choose a folder.",
-  "err.file_blocked": "Programs, scripts and shortcuts can't be opened as files. Use Open Application for programs.",
+  "err.file_blocked": "Programs and scripts can't be opened as files. Use Open Application for programs.",
   "err.guild_first": "Enter or load the server ID first.",
   "err.guild_id": "The server ID must be a 17–20 digit number.",
   "err.hotkey_failed": "can't be registered (error {code}, key {key})",

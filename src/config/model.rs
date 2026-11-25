@@ -147,6 +147,10 @@ impl Action {
                 if lower.is_empty() {
                     return Err("err.choose_file");
                 }
+                // Shortcuts get the same checks as in Open Application.
+                if is_shortcut(&lower) {
+                    return Action::OpenApp { path: path.clone(), args: String::new() }.validate();
+                }
                 if BLOCKED_EXTENSIONS.iter().any(|ext| lower.ends_with(ext)) {
                     return Err("err.file_blocked");
                 }
@@ -181,6 +185,17 @@ const BLOCKED_SCHEMES: [&str; 12] = [
     "file", "javascript", "vbscript", "data", "shell", "search", "search-ms", "ms-msdt", "ms-appinstaller",
     "ms-officecmd", "mk", "ms-its",
 ];
+
+/// A Windows shortcut (.lnk) or internet shortcut (.url).
+pub fn is_shortcut(path: &str) -> bool {
+    let lower = path.trim().trim_end_matches(['.', ' ']).to_ascii_lowercase();
+    lower.ends_with(".lnk") || lower.ends_with(".url")
+}
+
+/// An internet shortcut (.url), whose link NoKey opens itself.
+pub fn is_url_shortcut(path: &str) -> bool {
+    path.trim().trim_end_matches(['.', ' ']).to_ascii_lowercase().ends_with(".url")
+}
 
 /// The `URL=` value of an internet shortcut's `[InternetShortcut]` section.
 pub fn internet_shortcut_url(text: &str) -> Option<String> {
@@ -653,7 +668,8 @@ mod tests {
         let app = |p: &str| Action::OpenApp { path: p.into(), args: String::new() }.validate();
         assert!(file(r"C:\a\run.BAT").is_err());
         assert!(file(r"C:\a\run.bat. . ").is_err(), "trailing dots/spaces must not bypass the check");
-        assert!(file(r"C:\a\x.lnk").is_err());
+        assert!(file(r"C:\a\x.lnk").is_ok(), "shortcuts are allowed in Open File too");
+        assert!(file(r"C:\a\x.LNK. ").is_ok());
         assert!(file(r"C:\a\notes.txt:evil.bat").is_err(), "alternate data streams are rejected");
         assert!(file(r"C:\a\notes.txt").is_ok());
         assert!(app(r"C:\a\tool.exe").is_ok());
@@ -661,7 +677,8 @@ mod tests {
         assert!(app(r"C:\Windows\System32\cmd.exe").is_err());
         assert!(app(r"C:\Windows\System32\WindowsPowerShell\v1.0\POWERSHELL.EXE").is_err());
         assert!(app(r"C:\Start Menu\Steam\Dota 2.url").is_ok());
-        assert!(file(r"C:\Start Menu\Steam\Dota 2.url").is_err(), "Open File still refuses shortcuts");
+        assert!(file(r"C:\Start Menu\Steam\Dota 2.url").is_ok());
+        assert!(file(r"C:\a\x.url:evil.bat").is_err(), "alternate data streams are still rejected");
     }
 
     #[test]

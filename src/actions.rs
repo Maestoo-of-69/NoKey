@@ -2,7 +2,7 @@
 //! Only the action types in `config::Action` exist — there is no way to
 //! run arbitrary commands.
 
-use crate::config::{internet_shortcut_url, is_shortcut_url_allowed, Action, ActionKind};
+use crate::config::{internet_shortcut_url, is_shortcut_url_allowed, is_url_shortcut, Action, ActionKind};
 use crate::discord::api::{ApiError, Client};
 use crate::win::shell::{self, ShellFail};
 use std::time::Duration;
@@ -56,7 +56,7 @@ fn run_one(action: &Action, client: Option<&Client>) -> (Result<(), StepError>, 
                 Err(e) => (Err(StepError::Discord(e)), None),
             }
         }
-        Action::OpenApp { path, .. } if path.trim().to_ascii_lowercase().ends_with(".url") => {
+        Action::OpenApp { path, .. } | Action::OpenFile { path } if is_url_shortcut(path) => {
             (open_internet_shortcut(path.trim()), None)
         }
         Action::OpenApp { path, args } => (shell::open_existing_file(path, args).map_err(StepError::Shell), None),
@@ -152,6 +152,9 @@ mod tests {
         let app = Action::OpenApp { path: path.to_string_lossy().into_owned(), args: String::new() };
         let r = run(&[app], 0, true, None);
         assert_eq!(r.outcomes[0].result, Err(StepError::Invalid("err.url_shortcut")));
+        let file = Action::OpenFile { path: path.to_string_lossy().into_owned() };
+        let r = run(&[file], 0, true, None);
+        assert_eq!(r.outcomes[0].result, Err(StepError::Invalid("err.url_shortcut")), "Open File checks the link too");
         let missing = Action::OpenApp { path: dir.join("missing.url").to_string_lossy().into_owned(), args: String::new() };
         let r = run(&[missing], 0, true, None);
         assert_eq!(r.outcomes[0].result, Err(StepError::Shell(ShellFail::FileNotFound)));

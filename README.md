@@ -76,7 +76,7 @@ separate "Hold" mode: no action has a state that could be held.
 - **Discord Ping** — one message `<@USER_ID>`; only that user is pinged
   (`allowed_mentions.users`), never `@everyone`, `@here` or roles.
 - **Open Application** — `.exe`/`.lnk`, or a game/app shortcut `.url` (e.g. Steam's `steam://rungameid/570`; its link is opened, `file:` and script links are refused); command shells and script hosts are refused.
-- **Open File** (programs, scripts and shortcuts refused), **Open Folder**.
+- **Open File** (programs and scripts refused; `.lnk`/`.url` shortcuts work as in Open Application), **Open Folder**.
 - **Open URL in Default Browser** — `http(s)://` only, via `ShellExecuteW`;
   new tab vs. window is decided by the browser.
 - Up to 10 actions per binding, in order, with an optional pause between them
