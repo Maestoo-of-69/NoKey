@@ -87,7 +87,9 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         let msg = wparam as u32;
         let is_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
         let is_up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
-        if (is_down || is_up) && info.vkCode < 0xFF {
+        // Keys typed by a "Type text" action are not the user's: never match them.
+        let typed = info.dwExtraInfo == super::typer::TYPED_TAG;
+        if (is_down || is_up) && info.vkCode < 0xFF && !typed {
             // try_borrow: never panic if a message is pumped while state is borrowed
             let swallow =
                 STATE.with(|s| s.try_borrow_mut().map(|mut st| handle(&mut st, info.vkCode as u16, is_down)).unwrap_or(false));

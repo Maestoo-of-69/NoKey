@@ -1,11 +1,15 @@
 //! Local configuration (`config.json`). The bot token is NOT stored here —
 //! see `security::dpapi`.
 
+mod cancel;
 pub mod migrate;
 mod model;
 pub mod timing;
+pub mod type_text;
 
+pub use cancel::check as check_cancel_shortcut;
 pub use model::*;
+pub use type_text::{DEFAULT_CPM, MAX_TYPE_CHARS, TYPE_CPM_RANGE};
 
 use crate::shortcut::{Shortcut, MOD_ALT, MOD_CTRL};
 use std::fs;
@@ -101,6 +105,19 @@ impl Config {
             if b.trigger.mode.repeats() && b.has_discord() {
                 notes.push(format!("\"{}\": repeating Discord pings are not allowed; set to Press.", b.name));
                 b.trigger.mode = TriggerMode::Press;
+            }
+            if b.trigger.mode.repeats() && b.has_type_text() {
+                notes.push(format!("\"{}\": repeating Type text is not allowed; set to Press.", b.name));
+                b.trigger.mode = TriggerMode::Press;
+            }
+            for a in &mut b.actions {
+                if let Action::TypeText { cpm, .. } = a {
+                    clamp(cpm, TYPE_CPM_RANGE);
+                }
+            }
+            if let Err(key) = cancel::validate(b) {
+                notes.push(format!("\"{}\": the cancel shortcut was invalid ({key}) and was removed.", b.name));
+                b.cancel_shortcut = None;
             }
         }
         if let Some(sc) = &self.profile_switch

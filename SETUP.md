@@ -99,7 +99,7 @@ Settings → **General**:
 - **Cooldown** – minimum time between two runs of the same binding
   (0.01–3600 s; each binding can also have its own on its Trigger tab).
 
-**Ctrl + Alt + Pause** (or the big **DISABLE ALL BINDS** button) turns all
+**Ctrl + Alt + Pause** (or the master switch in the main window header) turns all
 bindings off and back on — handy for games. It always works and can't be
 assigned to a binding.
 

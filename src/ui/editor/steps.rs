@@ -3,7 +3,9 @@
 
 use super::super::theme::palette;
 use super::super::*;
-use super::{ed, layout as editor_layout, W};
+use super::layout::{labels, muted, muted_centered, place_field, Measure, BTN_EXTRA, DROP_EXTRA, TOGGLE_EXTRA};
+use super::type_text::{self, TypeCtl};
+use super::{ed, layout as editor_layout, CAP, content_w, FRAME_H, PAD, TOP, view_w};
 use crate::app::{self, api_error_text, TaskResult};
 use crate::config::{timing, Action, ActionKind, Binding, MAX_ACTIONS, STEP_DELAY_RANGE};
 use crate::discord::api::ApiError;
@@ -22,7 +24,19 @@ const ID_FIELD: i32 = 370; // 370..373
 const ID_FIELD_BTN: i32 = 380; // 380..383
 const ID_DELAY: i32 = 390;
 const ID_STOP: i32 = 391;
-const FIELD_Y: [i32; 3] = [276, 350, 424];
+
+// Actions tab rows (96-DPI units). The list frame holds three rows.
+pub(super) const ROW_H: i32 = 28;
+const LIST_Y: i32 = TOP + CAP;
+const LIST_H: i32 = 3 * ROW_H + 8;
+const BUTTONS_Y: i32 = LIST_Y + LIST_H + 4;
+const DELAY_Y: i32 = BUTTONS_Y + 32 + 12;
+const STEP_Y: i32 = DELAY_Y + FRAME_H + CAP;
+pub(super) const FIELDS_Y: i32 = STEP_Y + CAP;
+const DELAY_W: i32 = 80;
+/// Field labels sit in a measured column on the left, wrapped past the cap.
+pub(super) const LABEL_W: (i32, i32) = (72, 160);
+const LINE: i32 = 16;
 
 pub(in crate::ui) struct Steps {
     pub actions: Vec<Action>,
@@ -37,21 +51,37 @@ pub(in crate::ui) struct Steps {
     add_btn: HWND,
     fields: [HWND; 3],
     field_btns: [HWND; 3],
+    /// Controls of a Type text step (shown instead of `fields`).
+    typing: TypeCtl,
     delay: HWND,
     t_stop: HWND,
+    delay_label_w: i32,
+    field_btn_w: i32,
+    geo: FieldGeo,
 }
 
 impl Steps {
     pub fn edits(&self) -> Vec<HWND> {
         let mut v = self.fields.to_vec();
         v.push(self.delay);
+        v.push(self.typing.text);
         v
     }
+}
+
+/// Where the selected step's fields are (depends only on the action kind).
+#[derive(Clone, Copy, Default)]
+struct FieldGeo {
+    label_w: i32,
+    rows: [i32; 3],
+    hint_h: [i32; 3],
 }
 
 fn st<R>(f: impl FnOnce(&mut Steps) -> R) -> Option<R> {
     ed(|e| f(&mut e.steps))
 }
+
+// ---------- step fields ----------
 
 struct FieldSpec {
     label: &'static str,
@@ -73,6 +103,7 @@ fn spec(kind: ActionKind) -> [Option<FieldSpec>; 3] {
         ActionKind::OpenFile => [f("field.file", Some("field.browse"), "hint.file_cue"), None, None],
         ActionKind::OpenFolder => [f("field.folder", Some("field.browse"), "hint.folder_cue"), None, None],
         ActionKind::OpenUrl => [f("field.url", None, "hint.url_cue"), None, None],
+        ActionKind::TypeText => [None, None, None], // own controls: type_text.rs
     }
 }
 
@@ -84,6 +115,7 @@ fn values(a: &Action) -> [String; 3] {
         Action::OpenApp { path, args } => [path.clone(), args.clone(), String::new()],
         Action::OpenFile { path } | Action::OpenFolder { path } => [path.clone(), String::new(), String::new()],
         Action::OpenUrl { url } => [url.clone(), String::new(), String::new()],
+        Action::TypeText { .. } => Default::default(),
     }
 }
 
@@ -108,6 +140,7 @@ fn from_fields(old: &Action, v: &[String; 3]) -> Action {
         Action::OpenFile { .. } => Action::OpenFile { path: v[0].clone() },
         Action::OpenFolder { .. } => Action::OpenFolder { path: v[0].clone() },
         Action::OpenUrl { .. } => Action::OpenUrl { url: v[0].clone() },
+        Action::TypeText { .. } => old.clone(),
     }
 }
 
@@ -123,30 +156,103 @@ fn hint(a: &Action, i: usize) -> String {
     }
 }
 
-pub(super) fn create(hwnd: HWND) -> (Steps, Vec<HWND>) {
-    let b = |id, text: &str, kind, x, y, w, h| {
-        let btn = button(hwnd, id, text, kind);
-        place(btn, x, y, w, h);
+/// Label column, frame rows and hint heights for a kind's fields. Hints get
+/// at least one line (looked-up names appear there later).
+fn field_geometry(kind: ActionKind) -> FieldGeo {
+    let m = Measure::window(super::hwnd());
+    let small = fonts().small;
+    let specs = spec(kind);
+    let names: Vec<String> = specs.iter().flatten().map(|sp| t(sp.label)).collect();
+    let label_w = (m.widest(&names, small) + 4).clamp(LABEL_W.0, LABEL_W.1);
+    let hint_w = view_w() - PAD - (PAD + label_w + 12);
+    let empty = kind.empty();
+    // Three fields (Discord) end at 556 with two-line hints; the action bar starts at 564.
+    let max_lines = if names.len() == 3 { 2 } else { 3 };
+    let mut geo = FieldGeo { label_w, ..FieldGeo::default() };
+    let mut y = FIELDS_Y;
+    for (j, sp) in specs.iter().enumerate() {
+        if sp.is_none() {
+            continue;
+        }
+        geo.rows[j] = y;
+        geo.hint_h[j] = m.height(&hint(&empty, j), small, hint_w).clamp(LINE, max_lines * LINE);
+        y += FRAME_H + 4 + geo.hint_h[j] + 8;
+    }
+    geo
+}
+
+// ---------- creation ----------
+
+/// Add / Remove / Up / Down under the list, each sized to its label.
+fn create_list_buttons(hwnd: HWND, m: &Measure) -> [HWND; 4] {
+    let f = fonts();
+    let mut x = PAD;
+    let items = [
+        (ID_ADD, "editor.add_action", BTN_DROPDOWN), (ID_REMOVE, "editor.remove", BTN_SECONDARY),
+        (ID_UP, "editor.up", BTN_SECONDARY), (ID_DOWN, "editor.down", BTN_SECONDARY),
+    ];
+    items.map(|(id, key, kind)| {
+        let label = t(key);
+        let (font, extra) = if kind == BTN_DROPDOWN { (f.normal, DROP_EXTRA) } else { (f.bold, BTN_EXTRA) };
+        let w = (m.width(&label, font) + extra).max(64);
+        let btn = button(hwnd, id, &label, kind);
+        place(btn, x, BUTTONS_Y, w, 32);
+        x += w + 8;
         btn
-    };
-    let list = listbox(hwnd, ID_STEPS, 0);
-    place(list, 24, 82, W - 48, 120);
-    let add_btn = b(ID_ADD, &t("editor.add_action"), BTN_DROPDOWN, 24, 210, 150, 30);
-    let remove_btn = b(ID_REMOVE, &t("editor.remove"), BTN_SECONDARY, 182, 210, 110, 30);
-    let up_btn = b(ID_UP, &t("editor.up"), BTN_SECONDARY, 300, 210, 90, 30);
-    let down_btn = b(ID_DOWN, &t("editor.down"), BTN_SECONDARY, 398, 210, 118, 30);
-    let fields: [HWND; 3] = std::array::from_fn(|i| edit(hwnd, ID_FIELD + i as i32, 0));
-    let field_btns: [HWND; 3] =
-        std::array::from_fn(|i| b(ID_FIELD_BTN + i as i32, "", BTN_SECONDARY, W - 24 - 110, FIELD_Y[i] + 20, 110, 36));
+    })
+}
+
+/// "Pause between actions" label + field, then "stop on failure". Returns
+/// the field, the checkbox and the label width.
+fn create_delay_row(hwnd: HWND, m: &Measure) -> (HWND, HWND, i32) {
+    let f = fonts();
+    let label_w = m.width(&t("editor.step_delay"), f.small) + 4;
     let delay = edit(hwnd, ID_DELAY, 0);
-    place(delay, 34, 524, 90, 20);
-    let t_stop = b(ID_STOP, &t("editor.stop_on_failure"), BTN_TOGGLE, 150, 520, W - 174, 26);
+    let delay_x = PAD + label_w + 12;
+    place_field(delay, delay_x, DELAY_Y, DELAY_W);
+    let stop_label = t("editor.stop_on_failure");
+    let t_stop = button(hwnd, ID_STOP, &stop_label, BTN_TOGGLE);
+    let stop_x = delay_x + DELAY_W + 24;
+    let stop_w = (m.width(&stop_label, f.normal) + TOGGLE_EXTRA).min(view_w() - PAD - stop_x);
+    place(t_stop, stop_x, DELAY_Y + 4, stop_w, 28);
+    (delay, t_stop, label_w)
+}
+
+impl Steps {
+    /// The step list; it stretches with the window, like `stop_toggle`
+    /// (the rest of the tab is re-placed by `layout`).
+    pub(super) fn list(&self) -> HWND {
+        self.list
+    }
+
+    pub(super) fn stop_toggle(&self) -> HWND {
+        self.t_stop
+    }
+}
+
+pub(super) fn create(hwnd: HWND) -> (Steps, Vec<HWND>) {
+    let m = Measure::window(hwnd);
+    let list = listbox(hwnd, ID_STEPS, 0);
+    place(list, PAD + 4, LIST_Y + 4, content_w() - 8, LIST_H - 8);
+    kit::track_list_hover(list);
+    let [add_btn, remove_btn, up_btn, down_btn] = create_list_buttons(hwnd, &m);
+    let (delay, t_stop, delay_label_w) = create_delay_row(hwnd, &m);
+    let field_labels = labels(&["field.load", "field.check", "field.browse", "field.loading"]);
+    let field_btn_w = (m.widest(&field_labels, fonts().bold) + BTN_EXTRA).max(88);
+    // Each field before its button, so Tab goes field -> button -> next field.
+    let pairs: [(HWND, HWND); 3] = std::array::from_fn(|i| {
+        let field = edit(hwnd, ID_FIELD + i as i32, 0);
+        (field, button(hwnd, ID_FIELD_BTN + i as i32, "", BTN_SECONDARY))
+    });
+    let (fields, field_btns) = (pairs.map(|p| p.0), pairs.map(|p| p.1));
+    let typing = type_text::create(hwnd);
     add_tooltip(hwnd, delay, &t("tip.step_delay"));
     add_tooltip(hwnd, t_stop, &t("tip.stop_on_failure"));
     add_tooltip(hwnd, add_btn, &t("tip.add_action"));
     let mut group = vec![list, add_btn, remove_btn, up_btn, down_btn, delay, t_stop];
     group.extend(fields);
     group.extend(field_btns);
+    group.extend(typing.all());
     let steps = Steps {
         actions: Vec::new(),
         cur: None,
@@ -158,8 +264,12 @@ pub(super) fn create(hwnd: HWND) -> (Steps, Vec<HWND>) {
         add_btn,
         fields,
         field_btns,
+        typing,
         delay,
         t_stop,
+        delay_label_w,
+        field_btn_w,
+        geo: FieldGeo::default(),
     };
     (steps, group)
 }
@@ -180,6 +290,7 @@ pub(super) fn load(b: &Binding) {
 fn reload_list(select_index: Option<usize>) {
     let Some((list, count)) = st(|s| (s.list, s.actions.len())) else { return };
     unsafe {
+        super::kit::reset_list_hover(list);
         SendMessageW(list, LB_RESETCONTENT, 0, 0);
         for i in 0..count {
             SendMessageW(list, LB_ADDSTRING, 0, i as LPARAM);
@@ -193,11 +304,18 @@ fn reload_list(select_index: Option<usize>) {
 
 /// Puts the selected step into the fields.
 fn load_fields() {
-    let Some((action, fields)) = st(|s| (s.cur.and_then(|i| s.actions.get(i).cloned()), s.fields)) else { return };
+    let Some((action, fields, typing)) =
+        st(|s| (s.cur.and_then(|i| s.actions.get(i).cloned()), s.fields, s.typing))
+    else {
+        return;
+    };
     let vals = action.as_ref().map(values).unwrap_or_default();
     st(|s| s.loading = true);
     for (f, v) in fields.iter().zip(vals) {
         set_text(*f, &v);
+    }
+    if let Some(a) = action.as_ref().filter(|a| a.kind() == ActionKind::TypeText) {
+        type_text::load(&typing, a);
     }
     st(|s| s.loading = false);
     editor_layout();
@@ -205,8 +323,17 @@ fn load_fields() {
 
 /// Saves the field texts into the selected step.
 pub(super) fn commit() {
-    let Some((cur, fields)) = st(|s| (s.cur, s.fields)) else { return };
+    let Some((cur, fields, typing, kind)) =
+        st(|s| (s.cur, s.fields, s.typing, s.cur.and_then(|i| s.actions.get(i)).map(Action::kind)))
+    else {
+        return;
+    };
     let Some(i) = cur else { return };
+    if kind == Some(ActionKind::TypeText) {
+        let action = type_text::read(&typing);
+        st(|s| s.actions[i] = action);
+        return;
+    }
     let vals: [String; 3] = fields.map(|f| get_text(f).trim().to_string());
     st(|s| {
         if let Some(old) = s.actions.get(i).cloned() {
@@ -226,42 +353,51 @@ pub(super) fn read_options() -> Result<(u32, bool), String> {
     Ok((ms, is_checked(t_stop)))
 }
 
+/// Shows, places and labels the selected step's fields and buttons.
+fn place_fields(kind: Option<ActionKind>, fields: [HWND; 3], btns: [HWND; 3], btn_w: i32) {
+    let specs = kind.map(spec).unwrap_or([None, None, None]);
+    let geo = kind.map(field_geometry).unwrap_or_default();
+    st(|s| s.geo = geo);
+    let fx = PAD + geo.label_w + 12;
+    for (i, sp) in specs.iter().enumerate() {
+        let Some(sp) = sp else {
+            show(fields[i], false);
+            show(btns[i], false);
+            continue;
+        };
+        show(fields[i], true);
+        set_cue(fields[i], &t(sp.cue));
+        let right = if sp.button.is_some() { view_w() - PAD - btn_w - 8 } else { view_w() - PAD };
+        place_field(fields[i], fx, geo.rows[i], right - fx);
+        match sp.button {
+            Some(label) => {
+                set_text(btns[i], &t(label));
+                place(btns[i], view_w() - PAD - btn_w, geo.rows[i] + 2, btn_w, 32);
+                show(btns[i], true);
+            }
+            None => show(btns[i], false),
+        }
+    }
+}
+
 pub(super) fn layout() {
-    let Some((cur, action, count, fields, btns, ctrls)) = st(|s| {
+    let Some((cur, kind, count, fields, btns, ctrls, btn_w, typing)) = st(|s| {
         (
             s.cur,
-            s.cur.and_then(|i| s.actions.get(i).cloned()),
+            s.cur.and_then(|i| s.actions.get(i)).map(|a| a.kind()),
             s.actions.len(),
             s.fields,
             s.field_btns,
             [s.remove_btn, s.up_btn, s.down_btn, s.add_btn],
+            s.field_btn_w,
+            s.typing,
         )
     }) else {
         return;
     };
     let [remove, up, down, add] = ctrls;
-    let specs = action.as_ref().map(|a| spec(a.kind())).unwrap_or([None, None, None]);
-    for i in 0..3 {
-        match &specs[i] {
-            Some(sp) => {
-                show(fields[i], true);
-                set_cue(fields[i], &t(sp.cue));
-                let w = if sp.button.is_some() { W - 68 - 120 } else { W - 68 };
-                place(fields[i], 34, FIELD_Y[i] + 28, w, 20);
-                match sp.button {
-                    Some(label) => {
-                        set_text(btns[i], &t(label));
-                        show(btns[i], true);
-                    }
-                    None => show(btns[i], false),
-                }
-            }
-            None => {
-                show(fields[i], false);
-                show(btns[i], false);
-            }
-        }
-    }
+    place_fields(kind, fields, btns, btn_w);
+    type_text::place_controls(&typing, kind == Some(ActionKind::TypeText));
     enable(remove, count > 1);
     enable(up, cur.is_some_and(|i| i > 0));
     enable(down, cur.is_some_and(|i| i + 1 < count));
@@ -269,22 +405,30 @@ pub(super) fn layout() {
 }
 
 pub(super) fn paint(hdc: HDC) {
-    let Some((cur, action)) = st(|s| (s.cur, s.cur.and_then(|i| s.actions.get(i).cloned()))) else { return };
+    let Some((cur, action, geo, delay_w, typing)) =
+        st(|s| (s.cur, s.cur.and_then(|i| s.actions.get(i).cloned()), s.geo, s.delay_label_w, s.typing))
+    else {
+        return;
+    };
     let p = palette();
-    let f = fonts();
-    caption(hdc, &t("editor.actions_caption"), 24, 60, W - 48);
-    if let (Some(i), Some(a)) = (cur, &action) {
-        let title = tf("editor.step_title", &[("n", &(i + 1).to_string()), ("kind", &t(a.kind().key()))]);
-        caption(hdc, &title, 24, 252, W - 48);
-        for (j, sp) in spec(a.kind()).iter().enumerate() {
-            if let Some(sp) = sp {
-                caption(hdc, &t(sp.label), 24, FIELD_Y[j], W - 48);
-                let h = hint(a, j);
-                text(hdc, &h, &r(24, FIELD_Y[j] + 60, W - 48, 14), f.small, p.muted, DT_SINGLELINE | DT_END_ELLIPSIS);
-            }
+    caption(hdc, &t("editor.actions_caption"), PAD, TOP, content_w());
+    round_rect(hdc, &r(PAD, LIST_Y, content_w(), LIST_H), p.border, Some(p.surface), 8);
+    let delay_rc = r(PAD, DELAY_Y, delay_w, FRAME_H);
+    text(hdc, &t("editor.step_delay"), &delay_rc, fonts().small, p.muted, DT_SINGLELINE | DT_VCENTER);
+    let (Some(i), Some(a)) = (cur, &action) else { return };
+    let title = tf("editor.step_title", &[("n", &(i + 1).to_string()), ("kind", &t(a.kind().key()))]);
+    caption(hdc, &title, PAD, STEP_Y, content_w());
+    if a.kind() == ActionKind::TypeText {
+        type_text::paint(hdc, &typing);
+        return;
+    }
+    let fx = PAD + geo.label_w + 12;
+    for (j, sp) in spec(a.kind()).iter().enumerate() {
+        if let Some(sp) = sp {
+            muted_centered(hdc, &t(sp.label), &r(PAD, geo.rows[j], geo.label_w, FRAME_H));
+            muted(hdc, &hint(a, j), &r(fx, geo.rows[j] + FRAME_H + 4, view_w() - PAD - fx, geo.hint_h[j]));
         }
     }
-    text(hdc, &t("editor.step_delay"), &r(24, 498, 400, 16), f.small, p.muted, DT_SINGLELINE | DT_END_ELLIPSIS);
 }
 
 pub(in crate::ui) fn draw_row(dis: &DRAWITEMSTRUCT) {
@@ -292,37 +436,60 @@ pub(in crate::ui) fn draw_row(dis: &DRAWITEMSTRUCT) {
         return;
     }
     let Some(action) = st(|s| s.actions.get(dis.itemID as usize).cloned()).flatten() else { return };
-    let p = palette();
-    let rc = dis.rcItem;
-    let selected = dis.itemState & ODS_SELECTED != 0;
-    fill(dis.hDC, &rc, if selected { p.selected } else { p.surface });
-    if selected {
-        fill(dis.hDC, &RECT { right: rc.left + px(3), ..rc }, p.accent);
-    }
-    let target = action.target();
-    let target = if target.is_empty() { t("editor.not_set") } else { target };
-    let label = format!("{}.  {}  ·  {target}", dis.itemID + 1, t(action.kind().key()));
-    let tr = RECT { left: rc.left + px(12), right: rc.right - px(8), ..rc };
-    text(dis.hDC, &label, &tr, fonts().normal, p.text, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    let (p, f) = (palette(), fonts());
+    buffered_item(dis.hDC, &dis.rcItem, |hdc, rc| {
+        let rc = *rc;
+        let selected = dis.itemState & ODS_SELECTED != 0;
+        // Item data is the step index, so the effects key on the index.
+        let fx = kit::RowFx::read(dis.hwndItem, dis.itemID, dis.itemID);
+        fill(hdc, &rc, p.surface);
+        if let Some(c) = kit::row_fill(p.surface, selected, &fx) {
+            let inner = RECT { left: rc.left + px(2), top: rc.top + px(1), right: rc.right - px(2), bottom: rc.bottom - px(1) };
+            round_rect(hdc, &inner, c, Some(c), 6);
+        }
+        let flags = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS;
+        let (x, right) = (rc.left + px(10), rc.right - px(8));
+        text(hdc, &format!("{}.", dis.itemID + 1), &RECT { left: x, right: x + px(20), ..rc }, f.small, p.muted, flags);
+        let kind = t(action.kind().key());
+        let kx = x + px(22);
+        text(hdc, &kind, &RECT { left: kx, right, ..rc }, f.normal, p.text, flags);
+        let tx = kx + text_width(hdc, &kind, f.normal) + px(12);
+        if tx < right {
+            let target = app::action_detail(&action);
+            let target = if target.is_empty() { t("editor.not_set") } else { target };
+            text(hdc, &target, &RECT { left: tx, right, ..rc }, f.small, p.muted, flags);
+        }
+    });
 }
 
 /// Edit notifications from the step fields. Returns true when handled.
 pub(super) fn on_edit_change(id: i32, code: u32) -> bool {
-    if !(ID_FIELD..ID_FIELD + 3).contains(&id) {
+    if !(ID_FIELD..ID_FIELD + 3).contains(&id) && id != type_text::ID_TEXT {
         return false;
+    }
+    if code == EN_CHANGE
+        && id == type_text::ID_TEXT
+        && let Some(typing) = st(|s| s.typing)
+    {
+        type_text::on_text_change(&typing);
     }
     if code == EN_CHANGE && !st(|s| s.loading).unwrap_or(false) {
         commit();
-        if let Some((list, Some(i))) = st(|s| (s.list, s.cur)) {
-            let mut rc = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-            unsafe {
-                SendMessageW(list, LB_GETITEMRECT, i, &mut rc as *mut RECT as LPARAM);
-                InvalidateRect(list, &rc, 0);
-            }
-        }
+        refresh_row();
     }
     invalidate(super::hwnd());
     true
+}
+
+/// Repaints the selected row of the step list (its summary changed).
+fn refresh_row() {
+    if let Some((list, Some(i))) = st(|s| (s.list, s.cur)) {
+        let mut rc = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        unsafe {
+            SendMessageW(list, LB_GETITEMRECT, i, &mut rc as *mut RECT as LPARAM);
+            InvalidateRect(list, &rc, 0);
+        }
+    }
 }
 
 fn lookup_started(i: usize, started: Result<(), String>) {
@@ -502,6 +669,17 @@ pub(super) fn on_command(id: i32, code: u32) {
         ID_STOP => {
             if let Some(btn) = st(|s| s.t_stop) {
                 toggle(btn);
+            }
+        }
+        type_text::ID_SPEED if code == kit::SLIDER_CHANGED => {
+            commit();
+            refresh_row();
+            invalidate(hwnd);
+        }
+        type_text::ID_HUMAN | type_text::ID_ERASE => {
+            if let Some(typing) = st(|s| s.typing) {
+                toggle(if id == type_text::ID_ERASE { typing.erase } else { typing.human });
+                commit();
             }
         }
         _ => {}

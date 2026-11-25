@@ -46,6 +46,18 @@ pub enum Action {
     OpenUrl {
         url: String,
     },
+    /// Types `text` into the active window at `cpm` characters per minute.
+    TypeText {
+        text: String,
+        #[serde(default = "super::type_text::default_cpm")]
+        cpm: u32,
+        #[serde(default = "yes")]
+        human: bool,
+        /// Backspace the characters the triggering shortcut typed (e.g. a
+        /// "123" sequence) before typing.
+        #[serde(default = "yes")]
+        erase_trigger: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,11 +67,18 @@ pub enum ActionKind {
     OpenFile,
     OpenFolder,
     OpenUrl,
+    TypeText,
 }
 
 impl ActionKind {
-    pub const ALL: [ActionKind; 5] =
-        [ActionKind::DiscordPing, ActionKind::OpenApp, ActionKind::OpenFile, ActionKind::OpenFolder, ActionKind::OpenUrl];
+    pub const ALL: [ActionKind; 6] = [
+        ActionKind::DiscordPing,
+        ActionKind::OpenApp,
+        ActionKind::OpenFile,
+        ActionKind::OpenFolder,
+        ActionKind::OpenUrl,
+        ActionKind::TypeText,
+    ];
 
     /// Localization key of the action name.
     pub fn key(self) -> &'static str {
@@ -69,6 +88,7 @@ impl ActionKind {
             ActionKind::OpenFile => "action.open_file",
             ActionKind::OpenFolder => "action.open_folder",
             ActionKind::OpenUrl => "action.open_url",
+            ActionKind::TypeText => "action.type_text",
         }
     }
 
@@ -86,6 +106,12 @@ impl ActionKind {
             ActionKind::OpenFile => Action::OpenFile { path: String::new() },
             ActionKind::OpenFolder => Action::OpenFolder { path: String::new() },
             ActionKind::OpenUrl => Action::OpenUrl { url: String::new() },
+            ActionKind::TypeText => Action::TypeText {
+                text: String::new(),
+                cpm: super::type_text::DEFAULT_CPM,
+                human: true,
+                erase_trigger: true,
+            },
         }
     }
 }
@@ -98,6 +124,7 @@ impl Action {
             Action::OpenFile { .. } => ActionKind::OpenFile,
             Action::OpenFolder { .. } => ActionKind::OpenFolder,
             Action::OpenUrl { .. } => ActionKind::OpenUrl,
+            Action::TypeText { .. } => ActionKind::TypeText,
         }
     }
 
@@ -110,6 +137,7 @@ impl Action {
             }
             Action::OpenApp { path, .. } | Action::OpenFile { path } | Action::OpenFolder { path } => file_name(path),
             Action::OpenUrl { url } => url.clone(),
+            Action::TypeText { text, .. } => super::type_text::excerpt(text),
         }
     }
 
@@ -162,6 +190,7 @@ impl Action {
             Action::OpenUrl { url } => {
                 if is_web_url(url) { Ok(()) } else { Err("err.url") }
             }
+            Action::TypeText { text, cpm, .. } => super::type_text::validate(text, *cpm),
         }
     }
 }
@@ -411,6 +440,10 @@ pub struct Binding {
     pub notify: bool,
     #[serde(default)]
     pub conditions: Conditions,
+    /// Standard shortcut that stops this binding while it runs (typing or
+    /// a Repeat/Toggle loop). Registered only during a run.
+    #[serde(default)]
+    pub cancel_shortcut: Option<Shortcut>,
 }
 
 pub const STEP_DELAY_RANGE: (u32, u32) = (0, 60_000);
@@ -435,11 +468,16 @@ impl Binding {
             sound: false,
             notify: true,
             conditions: Conditions::default(),
+            cancel_shortcut: None,
         }
     }
 
     pub fn has_discord(&self) -> bool {
         self.actions.iter().any(|a| a.kind() == ActionKind::DiscordPing)
+    }
+
+    pub fn has_type_text(&self) -> bool {
+        self.actions.iter().any(|a| a.kind() == ActionKind::TypeText)
     }
 
     /// Checks everything that can be checked offline. Returns
@@ -464,7 +502,11 @@ impl Binding {
         if self.trigger.mode.repeats() && self.has_discord() {
             return Err(("err.repeat_discord", None));
         }
-        Ok(())
+        // Repeating would re-type the text on a timer: runaway typing.
+        if self.trigger.mode.repeats() && self.has_type_text() {
+            return Err(("err.repeat_typing", None));
+        }
+        super::cancel::validate(self).map_err(|k| (k, None))
     }
 }
 

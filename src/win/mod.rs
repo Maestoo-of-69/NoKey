@@ -8,12 +8,21 @@ pub mod icon;
 pub mod shell;
 pub mod startup;
 pub mod tray;
+pub mod typer;
 
 use std::cell::Cell;
 use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, WPARAM};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-/// Hook -> host window: binding `wparam` went down (`lparam` 1) or up (0).
+/// The top-level window of `hwnd` (itself when it is one). Dialogs must be
+/// owned by it: a page is a child window, and disabling only the page would
+/// leave the window around it usable.
+pub fn root(hwnd: HWND) -> HWND {
+    if hwnd.is_null() { hwnd } else { unsafe { GetAncestor(hwnd, GA_ROOT) } }
+}
+
+/// Hook -> host window: the shortcut with matcher id `wparam` (a binding's
+/// `hotkey_id`, or the profile switch) went down (`lparam` 1) or up (0).
 pub const WM_APP_FIRE: u32 = WM_APP + 1;
 /// Worker thread -> main window: results are waiting in `app`'s task queue.
 pub const WM_APP_TASK: u32 = WM_APP + 2;
@@ -56,7 +65,7 @@ pub fn set_text(hwnd: HWND, text: &str) {
 pub fn message_box(owner: HWND, text: &str, flags: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
     let t = wide(text);
     let c = wide("NoKey");
-    unsafe { MessageBoxW(owner, t.as_ptr(), c.as_ptr(), flags) }
+    unsafe { MessageBoxW(root(owner), t.as_ptr(), c.as_ptr(), flags) }
 }
 
 pub fn error_box(owner: HWND, text: &str) {

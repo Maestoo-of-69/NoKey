@@ -173,7 +173,35 @@ fn is_typing_key(vk: u16) -> bool {
     matches!(vk, 0x08 | 0x09 | 0x0D | 0x20 | 0x30..=0x39 | 0x41..=0x5A | 0x60..=0x6F | 0xBA..=0xC0 | 0xDB..=0xDE)
 }
 
+/// Keys that put one character into a text field when pressed without
+/// Ctrl/Alt/Win: letters, digits, space, OEM punctuation and the numpad.
+/// Backspace, Tab and Enter are not counted (they don't add a character).
+fn types_char(vk: u16) -> bool {
+    matches!(vk, 0x20 | 0x30..=0x39 | 0x41..=0x5A | 0x60..=0x6F | 0xBA..=0xC0 | 0xDB..=0xDF | 0xE2)
+}
+
+const STRONG_MODS: u8 = MOD_CTRL | MOD_ALT | MOD_WIN;
+
 impl Shortcut {
+    /// How many characters pressing this shortcut puts into the focused
+    /// app, i.e. how many Backspaces erase it. Standard shortcuts are
+    /// swallowed (RegisterHotKey or the hook), so they type nothing.
+    pub fn typed_chars(&self) -> usize {
+        match self {
+            Shortcut::Standard { .. } => 0,
+            Shortcut::Combo { keys } => {
+                let keys = sort_combo_keys(keys);
+                if keys.iter().any(|&k| mod_bit(k) & STRONG_MODS != 0) {
+                    return 0;
+                }
+                keys.iter().filter(|&&k| types_char(k)).count()
+            }
+            Shortcut::Sequence { steps } => {
+                steps.iter().filter(|s| s.mods & STRONG_MODS == 0 && types_char(normalize_vk(s.vk))).count()
+            }
+        }
+    }
+
     pub fn label(&self) -> String {
         match self {
             Shortcut::Standard { mods, vk } => stroke_label(&Stroke { mods: *mods, vk: *vk }),
@@ -314,6 +342,22 @@ mod tests {
         assert!(Shortcut::Combo { keys: vec![VK_CONTROL, VK_MENU] }.validate().is_err());
         assert!(Shortcut::Combo { keys: vec![0x41, 0x53, 0x44] }.validate().is_ok());
         assert!(Shortcut::Sequence { steps: vec![Stroke { mods: 0, vk: 0x41 }] }.validate().is_err());
+    }
+
+    #[test]
+    fn counts_characters_a_shortcut_types() {
+        let seq = |steps: &[(u8, u16)]| Shortcut::Sequence {
+            steps: steps.iter().map(|&(mods, vk)| Stroke { mods, vk }).collect(),
+        };
+        assert_eq!(seq(&[(0, 0x31), (0, 0x32), (0, 0x33)]).typed_chars(), 3, "1 → 2 → 3");
+        assert_eq!(seq(&[(MOD_SHIFT, 0x41), (0, 0xBE), (0, 0x20), (0, 0x61)]).typed_chars(), 4, "Shift, OEM, space, numpad");
+        assert_eq!(seq(&[(0, VK_CONTROL), (0, 0x4B), (MOD_CTRL, 0x43)]).typed_chars(), 1, "lone Ctrl and Ctrl+C type nothing");
+        assert_eq!(seq(&[(0, 0x77), (0, 0x0D), (0, 0x08), (MOD_ALT, 0x41)]).typed_chars(), 0, "F8, Enter, Backspace, Alt+A");
+        assert_eq!(Shortcut::Combo { keys: vec![0x41, 0x53] }.typed_chars(), 2);
+        assert_eq!(Shortcut::Combo { keys: vec![VK_SHIFT, 0x41, 0x53] }.typed_chars(), 2, "Shift alone still types");
+        assert_eq!(Shortcut::Combo { keys: vec![0xA2, 0x41, 0x53] }.typed_chars(), 0, "Ctrl blocks typing");
+        assert_eq!(Shortcut::Combo { keys: vec![0x77, 0x41] }.typed_chars(), 1, "F8 adds nothing");
+        assert_eq!(Shortcut::Standard { mods: 0, vk: 0x77 }.typed_chars(), 0, "swallowed");
     }
 
     #[test]

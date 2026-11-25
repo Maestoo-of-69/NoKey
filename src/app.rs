@@ -8,6 +8,9 @@
 //! Rule: never call into `ui` while `with()` holds the state borrowed —
 //! Win32 may re-enter a window procedure synchronously.
 
+mod run_keys;
+
+use crate::actions::typing::TypeFail;
 use crate::actions::{self, RunReport, StepError};
 use crate::config::{self, timing, *};
 use crate::discord::api::{wait_duration, ApiError, Client};
@@ -26,7 +29,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HWND, WAIT_ABANDONED, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
@@ -117,6 +121,15 @@ pub struct App {
     validation_generation: u64,
     cooldowns: Cooldowns,
     in_flight: HashSet<u32>,
+    /// Cancel flag of each running binding that can be stopped: it types
+    /// text, or it repeats and has a cancel shortcut. Other runs always finish.
+    cancels: HashMap<u32, Arc<AtomicBool>>,
+    /// Bindings typing text right now.
+    typing: HashSet<u32>,
+    /// Which shortcut of a binding went down last.
+    fired: HashMap<u32, usize>,
+    /// Cancel shortcuts of running bindings: false = Windows refused it.
+    cancel_keys: HashMap<u32, bool>,
     discord_until: Option<Instant>,
     pub hotkey_errors: HashMap<u32, String>,
     pub emergency_error: Option<String>,
@@ -188,6 +201,27 @@ pub fn step_error_text(e: &StepError) -> String {
         StepError::NoToken => t("discord.no_token"),
         StepError::Discord(e) => api_error_text(e),
         StepError::Shell(f) => shell_error_text(f),
+        StepError::Typing(f) => t(match f {
+            TypeFail::Busy => "err.typing_busy",
+            TypeFail::Modifiers => "err.typing_modifiers",
+            TypeFail::OwnWindow => "err.typing_own_window",
+            TypeFail::Elevated => "err.typing_elevated",
+            TypeFail::Blocked => "err.typing_blocked",
+            TypeFail::FocusLost => "err.typing_focus_lost",
+            TypeFail::NoWindow => "err.typing_no_window",
+        }),
+    }
+}
+
+/// An action's target as lists show it; Type text adds its speed:
+/// "300 chars/min · “first words…”" (UI thread: uses translations).
+pub fn action_detail(a: &Action) -> String {
+    match a {
+        Action::TypeText { cpm, .. } => {
+            let speed = tf("field.cpm_value", &[("cpm", &cpm.to_string())]);
+            tf("action.type_text_detail", &[("speed", &speed), ("text", &a.target())])
+        }
+        _ => a.target(),
     }
 }
 
@@ -197,7 +231,10 @@ pub fn actions_summary(b: &Binding) -> String {
     // Left-to-right marks (U+200E, invisible) around the target ("@friend ·
     // #general", a URL) keep "@" and "#" in place inside Hebrew text. GDI
     // supports LRM but draws the newer isolate characters as boxes.
-    let mut s = format!("{} · \u{200E}{}\u{200E}", t(first.kind().key()), first.target());
+    let mut s = match first {
+        Action::TypeText { .. } => format!("{} · {}", t(first.kind().key()), action_detail(first)),
+        _ => format!("{} · \u{200E}{}\u{200E}", t(first.kind().key()), first.target()),
+    };
     if b.actions.len() > 1 {
         s.push_str(&tf("main.more_actions", &[("count", &(b.actions.len() - 1).to_string())]));
     }
@@ -274,6 +311,8 @@ impl App {
         for id in self.registered.drain(..) {
             hotkey::unregister(self.host, id);
         }
+        self.release_cancel_keys();
+        self.fired.clear(); // shortcut indexes may have changed
         let stops = self.trigger.reset();
         self.stop_timers(stops);
         for id in self.repeats.keys().copied().collect::<Vec<_>>() {
@@ -318,7 +357,7 @@ impl App {
                             }
                         }
                         other => {
-                            matcher.add(b.id, b.priority, other);
+                            matcher.add(hotkey_id(b.id, i) as u32, b.priority, other);
                             hook_users.push(b.id);
                         }
                     }
@@ -340,10 +379,38 @@ impl App {
                 self.hotkey_errors.insert(id, e.clone());
             }
         }
+        self.sync_cancel_keys(); // typing that goes on keeps its cancel shortcut
+    }
+
+    /// Sets the cancel flag of a running binding. True if one was running.
+    fn cancel_run(&mut self, id: u32) -> bool {
+        self.cancels.get(&id).map(|c| c.store(true, Ordering::Release)).is_some()
+    }
+
+    fn cancel_all_runs(&mut self) {
+        for c in self.cancels.values() {
+            c.store(true, Ordering::Release);
+        }
+    }
+
+    /// Stops typing of bindings that are no longer active (profile switch,
+    /// disabled, deleted, all binds off).
+    fn cancel_inactive_typing(&mut self) {
+        let c = &self.config;
+        let stale = |id: &u32| {
+            c.binding(*id).is_none_or(|b| !c.bindings_enabled || !b.enabled || !c.in_active_profile(b))
+        };
+        for (_, flag) in self.cancels.iter().filter(|(id, _)| stale(id)) {
+            flag.store(true, Ordering::Release);
+        }
     }
 
     fn start(&mut self, id: u32, source: Source) -> Option<Notice> {
         let b = self.config.binding(id)?.clone();
+        // The same shortcut again stops typing (before cooldown and "busy" swallow the press).
+        if b.has_type_text() && self.in_flight.contains(&id) && self.cancel_run(id) {
+            return None;
+        }
         if source != Source::Button {
             let off = !self.config.bindings_enabled || !b.enabled || !self.config.in_active_profile(&b);
             if off || self.is_paused(id) {
@@ -358,6 +425,11 @@ impl App {
         }
         if let Err((key, _)) = b.validate() {
             let text = tf("status.failed", &[("name", &b.name), ("details", &t(key))]);
+            return Some(self.notice(false, text, b.sound, b.notify));
+        }
+        // Only one text at a time: refuse before any step runs.
+        if b.has_type_text() && !self.in_flight.contains(&id) && actions::typing::is_busy() {
+            let text = tf("status.failed", &[("name", &b.name), ("details", &t("err.typing_busy"))]);
             return Some(self.notice(false, text, b.sound, b.notify));
         }
         let length = Duration::from_millis(self.config.cooldown_for(&b) as u64);
@@ -381,22 +453,37 @@ impl App {
             return Some(self.notice(false, text, b.sound, b.notify));
         }
         self.in_flight.insert(id);
-        self.set_result(true, tf("status.running", &[("name", &b.name)]));
+        let running = if b.has_type_text() { "status.typing" } else { "status.running" };
+        self.set_result(true, tf(running, &[("name", &b.name)]));
         let token = if b.has_discord() { self.token.clone() } else { None };
         let (steps, delay, stop) = (b.actions.clone(), b.step_delay_ms, b.stop_on_failure);
+        let erase = self.erase_for_run(&b, source);
+        let cancel = Arc::new(AtomicBool::new(false));
+        if b.has_type_text() || (b.cancel_shortcut.is_some() && b.trigger.mode.repeats()) {
+            self.cancels.insert(id, cancel.clone());
+        }
+        if b.has_type_text() {
+            self.typing.insert(id);
+        }
         let started = self.spawn(move || TaskResult::Ran {
             binding: id,
-            report: actions::run(&steps, delay, stop, token.as_deref()),
+            report: actions::run(&steps, delay, stop, token.as_deref(), erase, &cancel),
         });
         if !started {
             self.in_flight.remove(&id);
+            self.cancels.remove(&id);
+            self.typing.remove(&id);
             return Some(self.notice(false, t("err.thread"), b.sound, b.notify));
         }
+        self.sync_cancel_keys();
         None
     }
 
     fn on_ran(&mut self, id: u32, report: RunReport) -> Option<Notice> {
         self.in_flight.remove(&id);
+        self.cancels.remove(&id);
+        self.typing.remove(&id);
+        self.sync_cancel_keys();
         let b = self.config.binding(id)?.clone();
         if let Some(w) = report.discord_wait {
             let until = Instant::now() + wait_duration(w);
@@ -414,6 +501,12 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        if report.cancelled && report.first_error().is_none() {
+            // The user stopped it: a quiet status line, no notification.
+            let key = if b.has_type_text() { "status.typing_cancelled" } else { "status.cancelled" };
+            self.set_result(true, tf(key, &[("name", &b.name)]));
+            return None;
         }
         let ok = report.ok();
         let repeating = self.repeats.contains_key(&id);
@@ -434,6 +527,7 @@ impl App {
         };
         if !ok && repeating {
             self.stop_repeat(id); // don't keep failing on a timer
+            self.sync_cancel_keys();
         }
         // While a binding repeats, only failures are announced.
         let announce = !repeating || !ok;
@@ -498,6 +592,7 @@ impl App {
         config::save(&self.dir, &next)?;
         self.config = next;
         self.apply_hotkeys();
+        self.cancel_inactive_typing();
         Ok(())
     }
 }
@@ -533,8 +628,12 @@ fn apply_effects(effects: Vec<Effect>) {
                 }
                 a.repeats.insert(id, (1, max));
                 unsafe { SetTimer(a.host, TIMER_REPEAT + id as usize, interval, None) };
+                a.sync_cancel_keys();
             }),
-            Effect::StopRepeat(id) => with(|a| a.stop_repeat(id)),
+            Effect::StopRepeat(id) => with(|a| {
+                a.stop_repeat(id);
+                a.sync_cancel_keys();
+            }),
             Effect::StartHold(id) => with(|a| unsafe {
                 SetTimer(a.host, TIMER_HOLD + id as usize, a.config.long_press_ms, None);
             }),
@@ -546,16 +645,21 @@ fn apply_effects(effects: Vec<Effect>) {
 }
 
 /// A shortcut went down (`Some(true)`), up (`Some(false)`) or was pressed
-/// as a whole (`None`, from RegisterHotKey).
-pub fn on_key(id: u32, down: Option<bool>) {
-    if id == PROFILE_SWITCH_ID {
+/// as a whole (`None`, from RegisterHotKey). `key` is `PROFILE_SWITCH_ID`
+/// or the `hotkey_id` of one of a binding's shortcuts.
+pub fn on_key(key: u32, down: Option<bool>) {
+    if key == PROFILE_SWITCH_ID {
         if down != Some(false) {
             next_profile();
         }
         return;
     }
+    let (id, index) = run_keys::split_id(key as i32);
     let effects = with(|a| {
         let mode = a.config.binding(id)?.trigger.mode;
+        if down != Some(false) {
+            a.fired.insert(id, index);
+        }
         Some(match down {
             None => a.trigger.tap(id, mode, tick()),
             Some(true) => a.trigger.down(id, mode, tick()),
@@ -570,8 +674,10 @@ pub fn on_hotkey(id: i32) {
         toggle_all();
     } else if id == PROFILE_SWITCH_HOTKEY {
         next_profile();
+    } else if let (binding, run_keys::CANCEL_INDEX) = run_keys::split_id(id) {
+        run_keys::cancel_pressed(binding);
     } else {
-        on_key(binding_of_hotkey(id), None);
+        on_key(id as u32, None);
     }
 }
 
@@ -593,6 +699,7 @@ pub fn on_timer(timer: usize) {
                 }
                 n
             });
+            with(|a| a.sync_cancel_keys()); // the loop may have just ended
             show_notice(notice);
             ui::main_window::refresh();
         }
@@ -626,6 +733,7 @@ pub fn run_binding(id: u32) {
 /// "Disable all binds" / "Enable all binds" (also Ctrl+Alt+Pause).
 pub fn toggle_all() {
     let notice = with(|a| {
+        a.cancel_all_runs(); // also when saving the switch fails: stop typing first
         let mut next = a.config.clone();
         next.bindings_enabled = !next.bindings_enabled;
         let enabled = next.bindings_enabled;
@@ -656,10 +764,14 @@ pub fn drain_tasks() {
 fn on_task(result: TaskResult) {
     match result {
         TaskResult::Ran { binding, report } => {
-            let ok = report.ok();
+            let (ok, cancelled) = (report.ok(), report.cancelled);
             let notice = with(|a| a.on_ran(binding, report));
             show_notice(notice);
-            ui::main_window::flash(binding, ok);
+            if cancelled {
+                ui::main_window::refresh();
+            } else {
+                ui::main_window::flash(binding, ok);
+            }
         }
         TaskResult::Validated { generation, new_token, result } => {
             let notice = with(|a| {
@@ -737,6 +849,7 @@ pub fn delete_binding(id: u32) -> Result<(), String> {
         let mut next = a.config.clone();
         next.bindings.retain(|b| b.id != id);
         a.paused.remove(&id);
+        a.cancel_run(id);
         a.commit(next)
     });
     after_change();
@@ -768,6 +881,9 @@ pub fn set_binding_enabled(id: u32, enabled: bool) -> Result<Option<String>, Str
         if let Some(b) = next.bindings.iter_mut().find(|b| b.id == id) {
             b.enabled = enabled;
         }
+        if !enabled {
+            a.cancel_run(id);
+        }
         a.commit(next)?;
         Ok(a.hotkey_errors.get(&id).cloned())
     });
@@ -778,6 +894,7 @@ pub fn set_binding_enabled(id: u32, enabled: bool) -> Result<Option<String>, Str
 /// Pauses one binding for a while (`None` = until NoKey restarts).
 pub fn pause_binding(id: u32, length: Option<Duration>) {
     with(|a| {
+        a.cancel_run(id);
         a.paused.insert(id, length.map(|l| Instant::now() + l));
         unsafe { KillTimer(a.host, TIMER_PAUSE + id as usize) };
         if let Some(l) = length {
@@ -962,9 +1079,11 @@ pub fn host_hwnd() -> HWND {
 
 fn release_resources() -> HWND {
     let host = with(|a| {
+        a.cancel_all_runs();
         for id in a.registered.drain(..) {
             hotkey::unregister(a.host, id);
         }
+        a.release_cancel_keys();
         let stops = a.trigger.reset();
         a.stop_timers(stops);
         a.host
@@ -1067,6 +1186,10 @@ pub fn run() -> i32 {
             validation_generation: 0,
             cooldowns: Cooldowns::default(),
             in_flight: HashSet::new(),
+            cancels: HashMap::new(),
+            typing: HashSet::new(),
+            fired: HashMap::new(),
+            cancel_keys: HashMap::new(),
             discord_until: None,
             hotkey_errors: HashMap::new(),
             emergency_error: None,

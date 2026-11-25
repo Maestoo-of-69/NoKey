@@ -1,32 +1,106 @@
-//! Main window: the "disable all" switch, profile, search and sort, the
-//! binding list, details of the selected binding, the run button and status.
+//! Main window (docs/DESIGN.md, "Main"): header bar with the master switch,
+//! profile and Discord status, a banner while binds are off, search and sort,
+//! the binding list, a detail line and the bottom action bar. Motion
+//! (docs/DESIGN.md "Motion"): the banner slides only after a click on the
+//! switch, the Run button crossfades its result only for a clicked run, and a
+//! row flashes when its binding ran (hotkey too) while the window is visible.
+
+mod menus;
+mod paint;
+mod row;
+mod view;
 
 use super::theme::palette;
 use super::*;
-use crate::app::{self, actions_summary, profile_name, App, Conn};
-use crate::config::{ActionKind, Binding, TriggerMode};
-use crate::i18n::{t, tf};
+use crate::app;
+use crate::config::Binding;
+use crate::i18n::t;
+use menus::{more_menu, profile_menu, sort_menu};
 use std::cell::RefCell;
-use std::time::Duration;
+use view::{build_view, run_label, run_labels, run_text, sort_short, Row, SortKey, View, SORT_KEYS};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{Ellipse, HDC};
+use windows_sys::Win32::Graphics::Gdi::HDC;
 
 const CLASS: &str = "NoKeyMain";
-const W: i32 = 560;
-const H: i32 = 666;
-const ROW_H: i32 = 44;
+fn view_w() -> i32 {
+    super::page::width()
+}
+/// Window side padding.
+const PAD: i32 = 16;
+const GAP: i32 = 8;
+const ROW_H: i32 = 40;
 const HEADER_H: i32 = 52;
 /// Taller header for themes with a Star of David, so the star can be large.
 const STAR_HEADER_H: i32 = 96;
+const BANNER_H: i32 = 32;
+const BAR_H: i32 = 56;
+const DETAIL_H: i32 = 24;
+const BTN_H: i32 = 32;
+/// The sort dropdown fits its widest label within these bounds.
+const SORT_MIN_W: i32 = 96;
+const SORT_MAX_W: i32 = 200;
+const SWITCH_W: i32 = 40;
+const SWITCH_H: i32 = 24;
+const PROFILE_MAX_W: i32 = 160;
+const PROFILE_MIN_W: i32 = 64;
+/// Horizontal padding of a text button (both sides together).
+const TEXT_BTN_PAD: i32 = 32;
+/// Label padding of a dropdown: 10 left, 24 for the arrow, plus slack.
+const DROPDOWN_PAD: i32 = 40;
+/// Status dot plus its gap before the connection text.
+const DOT_SPACE: i32 = 14;
+/// Gap between the title (and star) and the header controls.
+const HEADER_GAP: i32 = 12;
 
 /// Header height for the current theme.
 fn header_h() -> i32 {
     if palette().star.is_some() { STAR_HEADER_H } else { HEADER_H }
 }
 
-/// How far everything below the header moves down in the current theme.
-fn body_shift() -> i32 {
-    header_h() - HEADER_H
+/// Client height (96-DPI units), shared with the pages. A taller themed
+/// header takes its space from the binding list.
+fn height() -> i32 {
+    super::page::height()
+}
+
+/// Places everything again after the window changed size.
+pub fn relayout() {
+    let Some((ctl, laid, sort_w)) = st(|s| (s.ctl, s.banner_laid, s.sort_w)) else { return };
+    bar_layout(&ctl);
+    body_layout(&ctl, laid, sort_w);
+    refresh(); // places the header controls
+    unsafe { RedrawWindow(ctl.hwnd, std::ptr::null(), null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN) };
+}
+
+/// The binding list, which gets the focus back when a page closes.
+pub fn list() -> HWND {
+    st(|s| s.ctl.list).unwrap_or(null_mut())
+}
+
+/// `banner_h`: the banner's current height (0..BANNER_H, animated).
+fn search_top(banner_h: i32) -> i32 {
+    header_h() + banner_h + 12
+}
+
+fn caption_y(banner_h: i32) -> i32 {
+    search_top(banner_h) + 48
+}
+
+fn list_top(banner_h: i32) -> i32 {
+    caption_y(banner_h) + 22
+}
+
+/// Banner height for a shown / hidden banner.
+fn banner_target(shown: bool) -> i32 {
+    if shown { BANNER_H } else { 0 }
+}
+
+/// Animation slots on the main window.
+const SLOT_BANNER: u32 = 1;
+const SLOT_DOT: u32 = 2;
+
+fn list_bottom() -> i32 {
+    height() - BAR_H - DETAIL_H - 4
 }
 
 const ID_LIST: i32 = 100;
@@ -35,7 +109,7 @@ const ID_EDIT: i32 = 102;
 const ID_MORE: i32 = 103;
 const ID_RUN: i32 = 105;
 const ID_SETTINGS: i32 = 106;
-const ID_DISABLE_ALL: i32 = 107;
+const ID_SWITCH: i32 = 107;
 const ID_PROFILE: i32 = 108;
 const ID_SEARCH: i32 = 109;
 const ID_SORT: i32 = 110;
@@ -46,63 +120,25 @@ const FLASH_MS: u32 = 1500;
 /// Cooldowns shorter than this don't lock the run button.
 const MIN_LOCK_MS: u32 = 250;
 
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
-enum SortKey {
-    #[default]
-    Name,
-    Shortcut,
-    Action,
-    Profile,
-    Enabled,
-}
-
-const SORT_KEYS: [(SortKey, &str); 5] = [
-    (SortKey::Name, "sort.name"),
-    (SortKey::Shortcut, "sort.shortcut"),
-    (SortKey::Action, "sort.action"),
-    (SortKey::Profile, "sort.profile"),
-    (SortKey::Enabled, "sort.enabled"),
-];
-
-#[derive(Default, Clone)]
-struct Row {
-    id: u32,
-    icon: String,
-    name: String,
-    summary: String,
-    chip: String,
-    enabled: bool,
-    paused: bool,
-    problem: bool,
-}
-
-#[derive(Default, Clone)]
-struct View {
-    rows: Vec<Row>,
-    total: usize,
-    connected: bool,
-    conn_short: String,
-    all_enabled: bool,
-    emergency_error: Option<String>,
-    profile: String,
-    last_ping: String,
-    last_result: Option<(bool, String)>,
-    detail: [String; 2],
-    run_label: Option<String>,
-    selected_enabled: bool,
-    selected_paused: bool,
-}
-
-struct State {
+/// Window handles (copied out of the state so layout code never holds a borrow
+/// while Windows sends messages back).
+#[derive(Clone, Copy)]
+struct Controls {
     hwnd: HWND,
     list: HWND,
     search: HWND,
-    btn_disable_all: HWND,
-    btn_profile: HWND,
-    btn_sort: HWND,
-    btn_edit: HWND,
-    btn_more: HWND,
-    btn_run: HWND,
+    switch: HWND,
+    profile: HWND,
+    sort: HWND,
+    new: HWND,
+    edit: HWND,
+    more: HWND,
+    run: HWND,
+    settings: HWND,
+}
+
+struct State {
+    ctl: Controls,
     selected: Option<u32>,
     view: View,
     flash: Option<(u32, bool)>,
@@ -110,6 +146,20 @@ struct State {
     sort: SortKey,
     show_all: bool,
     told_about_tray: bool,
+    /// Layout inputs last applied: banner shown, profile label, connection text.
+    laid_out: Option<(bool, String, String)>,
+    /// Discord status area in the header (left, right; 96-DPI units).
+    status: (i32, i32),
+    /// Last banner text, still drawn while the banner slides away.
+    banner_msg: String,
+    /// The switch is being clicked with the mouse: a banner change slides.
+    banner_armed: bool,
+    /// Banner height the body was last laid out for.
+    banner_laid: i32,
+    /// Sort dropdown width (measured on a real relayout, reused per banner frame).
+    sort_w: i32,
+    /// Binding started with a mouse click on Run: its result crossfades.
+    run_armed: Option<u32>,
 }
 
 thread_local! {
@@ -127,17 +177,19 @@ pub fn register(icon: HICON) {
 }
 
 pub fn create() {
-    create_window(CLASS, "NoKey", W, H + body_shift(), null_mut());
+    super::page::reset_size();
+    create_window(CLASS, "NoKey", view_w(), height(), null_mut());
     refresh();
 }
 
 pub fn hwnd() -> HWND {
-    st(|s| s.hwnd).unwrap_or(null_mut())
+    st(|s| s.ctl.hwnd).unwrap_or(null_mut())
 }
 
 pub fn is_foreground() -> bool {
     let h = hwnd();
-    !h.is_null() && unsafe { GetForegroundWindow() } == h
+    // With a page open the status line is covered: notifications still show.
+    !h.is_null() && !super::page::is_open() && unsafe { GetForegroundWindow() } == h
 }
 
 pub fn show_main() {
@@ -175,9 +227,17 @@ pub fn destroy() {
 
 /// Re-creates the window (new language / layout direction).
 pub fn rebuild() {
-    let was_visible = is_visible(hwnd());
+    let old = hwnd();
+    let was_visible = is_visible(old);
+    // Size, position and "maximized" carry over to the new window.
+    let mut placement: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
+    placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+    let known = was_visible && unsafe { GetWindowPlacement(old, &mut placement) } != 0;
     destroy();
     create();
+    if known {
+        unsafe { SetWindowPlacement(hwnd(), &placement) };
+    }
     if was_visible {
         show_main();
     }
@@ -191,138 +251,20 @@ pub fn select(id: u32) {
     refresh();
 }
 
-fn chip(b: &Binding) -> String {
-    match b.shortcuts.as_slice() {
-        [] => t("main.no_shortcut"),
-        [one] => one.label(),
-        [first, rest @ ..] => format!("{} +{}", first.label(), rest.len()),
-    }
+/// Width taken by the star next to the title (Jewish theme), with its gap.
+fn star_space() -> i32 {
+    if palette().star.is_some() { HEADER_GAP + header_h() - 18 } else { 0 }
 }
 
-fn matches_query(a: &App, b: &Binding, q: &str) -> bool {
-    if q.is_empty() {
-        return true;
-    }
-    let hay = format!(
-        "{} {} {} {} {}",
-        b.name,
-        b.description,
-        actions_summary(b),
-        b.shortcuts.iter().map(|s| s.label()).collect::<Vec<_>>().join(" "),
-        profile_name(&a.config, b.profile)
-    )
-    .to_lowercase();
-    q.split_whitespace().all(|w| hay.contains(w))
-}
+// ---------- refresh ----------
 
-fn build_view(a: &mut App, selected: Option<u32>, sort: SortKey, show_all: bool, query: &str) -> View {
-    let paused = a.paused_ids();
-    let q = query.trim().to_lowercase();
-    let mut list: Vec<&Binding> = a
-        .config
-        .bindings
-        .iter()
-        .filter(|b| show_all || a.config.in_active_profile(b))
-        .filter(|b| matches_query(a, b, &q))
-        .collect();
-    match sort {
-        SortKey::Name => list.sort_by_key(|b| b.name.to_lowercase()),
-        SortKey::Shortcut => list.sort_by_key(|b| (b.shortcuts.is_empty(), chip(b).to_lowercase())),
-        SortKey::Action => list.sort_by_key(|b| (t(b.actions.first().map_or("", |x| x.kind().key())), b.name.to_lowercase())),
-        SortKey::Profile => list.sort_by_key(|b| (profile_name(&a.config, b.profile), b.name.to_lowercase())),
-        SortKey::Enabled => list.sort_by_key(|b| (!b.enabled, b.name.to_lowercase())),
-    }
-    let rows = list
-        .iter()
-        .map(|b| {
-            let mut summary = actions_summary(b);
-            if b.trigger.mode != TriggerMode::Press {
-                summary = format!("{} · {summary}", t(b.trigger.mode.key()));
-            }
-            if show_all {
-                summary = format!("{} · {summary}", profile_name(&a.config, b.profile));
-            }
-            let paused_now = paused.contains(&b.id);
-            Row {
-                id: b.id,
-                icon: if b.icon.is_empty() { b.name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default() } else { b.icon.clone() },
-                name: b.name.clone(),
-                summary,
-                chip: if !b.enabled {
-                    t("main.off")
-                } else if paused_now {
-                    t("main.paused")
-                } else {
-                    chip(b)
-                },
-                enabled: b.enabled && !paused_now,
-                paused: paused_now,
-                problem: a.hotkey_errors.contains_key(&b.id),
-            }
-        })
-        .collect();
-    let mut v = View {
-        rows,
-        total: a.config.bindings.iter().filter(|b| b.enabled && a.config.in_active_profile(b)).count(),
-        connected: matches!(a.conn, Conn::Connected(_)),
-        conn_short: match a.conn {
-            Conn::Connected(_) => t("main.connected"),
-            Conn::Checking => t("main.checking"),
-            _ => t("main.disconnected"),
-        },
-        all_enabled: a.config.bindings_enabled,
-        emergency_error: a.emergency_error.clone(),
-        profile: profile_name(&a.config, a.config.active_profile),
-        last_ping: if a.last_ping.is_empty() { "—".into() } else { a.last_ping.clone() },
-        last_result: a.last_result.clone(),
-        ..View::default()
-    };
-    if let Some(b) = selected.and_then(|id| a.config.binding(id)) {
-        v.selected_enabled = b.enabled;
-        v.selected_paused = paused.contains(&b.id);
-        v.detail[0] = actions_summary(b);
-        let keys = if b.shortcuts.is_empty() {
-            t("main.no_shortcut")
-        } else {
-            b.shortcuts.iter().map(|s| s.label()).collect::<Vec<_>>().join("  |  ")
-        };
-        let problem = a.hotkey_errors.get(&b.id).map(|e| format!("  ⚠ {e}")).unwrap_or_default();
-        v.detail[1] = format!("{keys} · {} · {}{problem}", t(b.trigger.mode.key()), profile_name(&a.config, b.profile));
-        let all_discord = b.actions.iter().all(|x| x.kind() == ActionKind::DiscordPing);
-        v.run_label = Some(t(if all_discord { "main.run_ping" } else { "main.run" }));
-    }
-    v
-}
-
-/// Rebuilds the view from the app state and updates every control.
-pub fn refresh() {
-    let Some((hwnd, selected, sort, show_all, search)) = st(|s| (s.hwnd, s.selected, s.sort, s.show_all, s.search)) else {
-        return;
-    };
-    let query = crate::win::get_text(search);
-    let (view, selected) = app::with(|a| {
-        let visible = build_view(a, None, sort, show_all, &query);
-        let sel = selected.filter(|id| visible.rows.iter().any(|r| r.id == *id)).or_else(|| visible.rows.first().map(|r| r.id));
-        (build_view(a, sel, sort, show_all, &query), sel)
-    });
-    let Some((list, edit, more, run, disable_all, profile, sort_btn, label)) = st(|s| {
-        s.selected = selected;
-        let label = match s.flash {
-            _ if view.run_label.is_none() => t("main.select_binding"),
-            Some((id, ok)) if Some(id) == selected => t(if ok { "main.done" } else { "main.failed" }),
-            _ => view.run_label.clone().unwrap_or_default(),
-        };
-        s.view = view.clone();
-        (s.list, s.btn_edit, s.btn_more, s.btn_run, s.btn_disable_all, s.btn_profile, s.btn_sort, label)
-    }) else {
-        return;
-    };
-
+fn fill_list(list: HWND, rows: &[Row], selected: Option<u32>) {
     unsafe {
         SendMessageW(list, WM_SETREDRAW, 0, 0);
+        super::kit::reset_list_hover(list);
         SendMessageW(list, LB_RESETCONTENT, 0, 0);
         let mut sel_index = -1isize;
-        for (i, row) in view.rows.iter().enumerate() {
+        for (i, row) in rows.iter().enumerate() {
             SendMessageW(list, LB_ADDSTRING, 0, row.id as LPARAM);
             if Some(row.id) == selected {
                 sel_index = i as isize;
@@ -332,18 +274,52 @@ pub fn refresh() {
         SendMessageW(list, WM_SETREDRAW, 1, 0);
         InvalidateRect(list, null(), 1);
     }
+    show(list, !rows.is_empty() && !super::page::is_open());
+}
+
+/// Rebuilds the view from the app state and updates every control.
+pub fn refresh() {
+    let Some((ctl, selected, sort, show_all)) = st(|s| (s.ctl, s.selected, s.sort, s.show_all)) else {
+        return;
+    };
+    let query = crate::win::get_text(ctl.search);
+    let (view, selected) = app::with(|a| {
+        let visible = build_view(a, None, sort, show_all, &query);
+        let sel = selected.filter(|id| visible.rows.iter().any(|r| r.id == *id)).or_else(|| visible.rows.first().map(|r| r.id));
+        (build_view(a, sel, sort, show_all, &query), sel)
+    });
+    let banner = !view.all_enabled || view.emergency_error.is_some();
+    let key = (banner, view.profile.clone(), view.conn_short.clone());
+    let Some((label, cooling, relayout, tint, was_banner)) = st(|s| {
+        s.selected = selected;
+        s.view = view.clone();
+        let tint = s.flash.filter(|(id, _)| Some(*id) == selected).map(|(_, ok)| ok);
+        let was = s.laid_out.as_ref().map(|k| k.0);
+        (run_label(&view, s.flash, selected), s.cooling, s.laid_out.as_ref() != Some(&key), tint, was)
+    }) else {
+        return;
+    };
+
+    if relayout {
+        slide_banner(&ctl, was_banner, banner);
+        let status = header_layout(&ctl, &view.profile, &view.conn_short);
+        st(|s| {
+            s.status = status;
+            s.laid_out = Some(key);
+        });
+    }
+    fill_list(ctl.list, &view.rows, selected);
     let has_sel = selected.is_some();
-    enable(edit, has_sel);
-    enable(more, has_sel);
-    crate::win::set_text(run, &label);
-    let cooling = st(|s| s.cooling).unwrap_or(false);
-    enable(run, has_sel && !cooling);
-    crate::win::set_text(disable_all, &t(if view.all_enabled { "main.disable_all" } else { "main.enable_all" }));
-    set_kind(disable_all, if view.all_enabled { BTN_BIG } else { BTN_WARN });
-    crate::win::set_text(profile, &view.profile);
-    let sort_label = SORT_KEYS.iter().find(|(k, _)| *k == sort).map(|(_, key)| t(key)).unwrap_or_default();
-    crate::win::set_text(sort_btn, &sort_label);
-    invalidate(hwnd);
+    enable(ctl.edit, has_sel);
+    enable(ctl.more, has_sel);
+    crate::win::set_text(ctl.run, &label);
+    kit::set_tint(ctl.run, tint);
+    enable(ctl.run, has_sel && !cooling);
+    set_checked(ctl.switch, view.all_enabled);
+    crate::win::set_text(ctl.profile, &view.profile);
+    let sort_label = SORT_KEYS.iter().find(|(k, _)| *k == sort).map(|(_, key)| sort_short(key)).unwrap_or_default();
+    crate::win::set_text(ctl.sort, &sort_label);
+    invalidate(ctl.hwnd);
 }
 
 /// Called right after a binding was started from the window: locks the run
@@ -353,62 +329,195 @@ pub fn after_run(id: u32) {
     st(|s| {
         if s.selected == Some(id) && cooldown_ms >= MIN_LOCK_MS {
             s.cooling = true;
-            unsafe { SetTimer(s.hwnd, TIMER_COOLDOWN, cooldown_ms, None) };
+            unsafe { SetTimer(s.ctl.hwnd, TIMER_COOLDOWN, cooldown_ms, None) };
         }
     });
     refresh();
 }
 
-/// Briefly shows success or failure on the run button.
+/// Briefly shows success or failure on the run button and the detail line,
+/// and flashes the binding's row (only while the window is on screen).
 pub fn flash(id: u32, ok: bool) {
-    st(|s| {
+    let Some((ctl, clicked)) = st(|s| {
         s.flash = Some((id, ok));
-        unsafe { SetTimer(s.hwnd, TIMER_FLASH, FLASH_MS, None) };
-    });
+        unsafe { SetTimer(s.ctl.hwnd, TIMER_FLASH, FLASH_MS, None) };
+        (s.ctl, s.run_armed == Some(id) && s.selected == Some(id))
+    }) else {
+        return;
+    };
     refresh();
+    if is_visible(ctl.hwnd) && unsafe { IsIconic(ctl.hwnd) } == 0 {
+        let (on, off) = if ok { (kit::ROW_OK, kit::ROW_ERR) } else { (kit::ROW_ERR, kit::ROW_OK) };
+        anim::cancel(ctl.list, kit::row_slot(off, id));
+        anim::start(ctl.list, kit::row_slot(on, id), 1.0, 0.0, kit::RUN_FLASH_MS);
+        if clicked {
+            kit::fade_tint(ctl.run, true);
+        }
+    }
+}
+
+/// End of the result flash: a clicked run's tint fades back out.
+fn end_flash() {
+    if let Some((run, Some(_))) = st(|s| {
+        s.flash = None;
+        (s.ctl.run, s.run_armed.take())
+    }) {
+        kit::fade_tint(run, false);
+    }
+}
+
+// ---------- layout ----------
+
+/// Places the header controls right to left (switch, profile) and returns the
+/// area left for the Discord status.
+fn header_layout(c: &Controls, profile: &str, conn: &str) -> (i32, i32) {
+    let f = fonts();
+    let cy = header_h() / 2;
+    let switch_x = view_w() - PAD - SWITCH_W;
+    place(c.switch, switch_x, cy - SWITCH_H / 2, SWITCH_W, SWITCH_H);
+    let title_right = PAD + measure_text(c.hwnd, "NoKey", f.title) + star_space();
+    let status_w = DOT_SPACE + measure_text(c.hwnd, conn, f.small);
+    let room = switch_x - HEADER_GAP - (title_right + HEADER_GAP) - status_w - HEADER_GAP;
+    let want = measure_text(c.hwnd, profile, f.normal) + DROPDOWN_PAD;
+    let profile_w = want.min(PROFILE_MAX_W).min(room).max(PROFILE_MIN_W);
+    let profile_x = switch_x - HEADER_GAP - profile_w;
+    place(c.profile, profile_x, cy - BTN_H / 2, profile_w, BTN_H);
+    (title_right + HEADER_GAP, profile_x - HEADER_GAP)
+}
+
+/// Width of the sort dropdown: its widest label in the current language.
+fn sort_width(hwnd: HWND) -> i32 {
+    let widest = SORT_KEYS.iter().map(|(_, key)| measure_text(hwnd, &sort_short(key), fonts().normal)).max().unwrap_or(0);
+    (widest + DROPDOWN_PAD).clamp(SORT_MIN_W, SORT_MAX_W)
+}
+
+/// Search row and list; they move down while the banner shows. Moved in one
+/// DeferWindowPos batch so a sliding banner does not flicker.
+fn body_layout(c: &Controls, banner_h: i32, sort_w: i32) {
+    let top = search_top(banner_h);
+    let field_w = view_w() - 2 * PAD - sort_w - GAP;
+    let list_y = list_top(banner_h);
+    // The field frame (edit_frames) adds 10 x 8 around the edit control.
+    // Rows are inset 4 inside the list, so the selection lines up with PAD.
+    let moves = [
+        (c.search, PAD + 10, top + 8, field_w - 20, 20),
+        (c.sort, view_w() - PAD - sort_w, top + 2, sort_w, BTN_H),
+        (c.list, PAD - 4, list_y, view_w() - 2 * (PAD - 4), list_bottom() - list_y),
+    ];
+    unsafe {
+        let mut dwp = BeginDeferWindowPos(moves.len() as i32);
+        for (h, x, y, w, hh) in moves {
+            if !dwp.is_null() {
+                dwp = DeferWindowPos(dwp, h, null_mut(), px(x), px(y), px(w), px(hh), SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
+        if !dwp.is_null() {
+            EndDeferWindowPos(dwp);
+        }
+    }
+    st(|s| {
+        s.banner_laid = banner_h;
+        s.sort_w = sort_w;
+    });
+}
+
+/// Banner shown/hidden changed (or first layout): slide after a mouse click
+/// on the switch, snap otherwise (hotkey, keyboard, emergency error).
+fn slide_banner(c: &Controls, was: Option<bool>, now: bool) {
+    let armed = st(|s| s.banner_armed).unwrap_or(false);
+    match was {
+        Some(was) if was != now && armed => {
+            let from = anim::value(c.hwnd, SLOT_BANNER, banner_target(was) as f32);
+            anim::animate(c.hwnd, SLOT_BANNER, from, banner_target(now) as f32, kit::BANNER_MS);
+        }
+        Some(was) if was == now => {}
+        _ => anim::cancel(c.hwnd, SLOT_BANNER),
+    }
+    body_layout(c, banner_h(c.hwnd, now), sort_width(c.hwnd));
+}
+
+/// Current banner height (animated while sliding).
+fn banner_h(hwnd: HWND, shown: bool) -> i32 {
+    anim::value(hwnd, SLOT_BANNER, banner_target(shown) as f32).round() as i32
+}
+
+/// Animation frame of the main window: follows a sliding banner.
+fn on_anim_frame(hwnd: HWND) {
+    let Some((ctl, shown, laid, sort_w)) = st(|s| (s.ctl, s.laid_out.as_ref().is_some_and(|k| k.0), s.banner_laid, s.sort_w)) else {
+        return;
+    };
+    let h = banner_h(hwnd, shown);
+    if h != laid {
+        body_layout(&ctl, h, sort_w);
+    }
+}
+
+/// Bottom bar: New, Edit, More on the left; Run and Settings on the right.
+/// Widths come from the labels, so long translations are never cut.
+fn bar_layout(c: &Controls) {
+    let f = fonts();
+    let y = height() - BAR_H + (BAR_H - BTN_H) / 2;
+    let text_w = |s: &str| measure_text(c.hwnd, s, f.bold) + TEXT_BTN_PAD;
+    let new_w = text_w(&t("main.new"));
+    let edit_w = text_w(&t("main.edit"));
+    let mut more_w = measure_text(c.hwnd, &t("main.more"), f.normal) + DROPDOWN_PAD;
+    let run_w = run_labels().iter().map(|l| text_w(l)).max().unwrap_or(0);
+    let settings_x = view_w() - PAD - BTN_H;
+    let edit_x = PAD + new_w + GAP;
+    let more_x = edit_x + edit_w + GAP;
+    let mut run_x = settings_x - GAP - run_w;
+    if more_x + more_w + GAP > run_x {
+        // Not enough room for the labelled dropdown: fall back to the icon.
+        set_kind(c.more, BTN_ICON);
+        crate::win::set_text(c.more, "⋯");
+        more_w = BTN_H;
+    } else {
+        // Room again after the window grew.
+        set_kind(c.more, BTN_DROPDOWN);
+        crate::win::set_text(c.more, &t("main.more"));
+    }
+    run_x = run_x.max(more_x + more_w + GAP);
+    place(c.new, PAD, y, new_w, BTN_H);
+    place(c.edit, edit_x, y, edit_w, BTN_H);
+    place(c.more, more_x, y, more_w, BTN_H);
+    place(c.run, run_x, y, (settings_x - GAP - run_x).max(BTN_H), BTN_H);
+    place(c.settings, settings_x, y, BTN_H, BTN_H);
 }
 
 fn on_create(hwnd: HWND) {
-    // y values below are for the standard header; `dy` moves them under a taller one.
-    let dy = body_shift();
-    let b = |id, text: &str, kind, x, y, w, h| {
-        let btn = button(hwnd, id, text, kind);
-        place(btn, x, y + dy, w, h);
-        btn
+    let b = |id, text: &str, kind| button(hwnd, id, text, kind);
+    // Fields are evaluated in order, and creation order is the Tab order:
+    // keep it the visual order (header, search row, list, action bar).
+    let ctl = Controls {
+        hwnd,
+        profile: b(ID_PROFILE, "", BTN_DROPDOWN),
+        switch: b(ID_SWITCH, "", BTN_SWITCH),
+        search: edit(hwnd, ID_SEARCH, 0),
+        sort: b(ID_SORT, "", BTN_DROPDOWN),
+        list: listbox(hwnd, ID_LIST, 0),
+        new: b(ID_NEW, &t("main.new"), BTN_PRIMARY),
+        edit: b(ID_EDIT, &t("main.edit"), BTN_SECONDARY),
+        more: b(ID_MORE, &t("main.more"), BTN_DROPDOWN),
+        run: b(ID_RUN, &run_text(&t("main.run")), BTN_SECONDARY),
+        settings: b(ID_SETTINGS, "⚙", BTN_ICON),
     };
-    let btn_settings = b(ID_SETTINGS, &t("main.settings"), BTN_SECONDARY, W - 24 - 120, 12 - dy / 2, 120, 30);
-    let btn_disable_all = b(ID_DISABLE_ALL, &t("main.disable_all"), BTN_BIG, 24, 60, W - 48, 48);
-    let btn_profile = b(ID_PROFILE, "", BTN_DROPDOWN, 24, 136, 170, 32);
-    let search = edit(hwnd, ID_SEARCH, 0);
-    place(search, 212, 142 + dy, 196, 20);
-    set_cue(search, &t("main.search"));
-    let btn_sort = b(ID_SORT, "", BTN_DROPDOWN, 426, 136, 110, 32);
-    let list = listbox(hwnd, ID_LIST, 0);
-    place(list, 24, 202 + dy, W - 48, 4 * ROW_H);
-    b(ID_NEW, &t("main.new"), BTN_PRIMARY, 24, 388, 160, 32);
-    let btn_edit = b(ID_EDIT, &t("main.edit"), BTN_SECONDARY, 192, 388, 110, 32);
-    let btn_more = b(ID_MORE, &t("main.more"), BTN_DROPDOWN, 310, 388, 140, 32);
-    let btn_run = b(ID_RUN, &t("main.select_binding"), BTN_PRIMARY, 24, 508, W - 48, 50);
+    set_cue(ctl.search, &t("main.search"));
+    kit::track_list_hover(ctl.list);
+    bar_layout(&ctl);
+    let sort_w = sort_width(hwnd);
+    body_layout(&ctl, 0, sort_w);
 
-    add_tooltip(hwnd, btn_disable_all, &t("tip.disable_all"));
-    add_tooltip(hwnd, btn_profile, &t("tip.profile"));
-    add_tooltip(hwnd, search, &t("tip.search"));
-    add_tooltip(hwnd, btn_sort, &t("tip.sort"));
-    add_tooltip(hwnd, btn_more, &t("tip.more"));
-    add_tooltip(hwnd, btn_settings, &t("tip.settings"));
+    add_tooltip(hwnd, ctl.switch, &t("tip.disable_all"));
+    add_tooltip(hwnd, ctl.profile, &t("tip.profile"));
+    add_tooltip(hwnd, ctl.search, &t("tip.search"));
+    add_tooltip(hwnd, ctl.sort, &t("tip.sort"));
+    add_tooltip(hwnd, ctl.more, &t("tip.more"));
+    add_tooltip(hwnd, ctl.settings, &t("tip.settings"));
 
     let (sort, show_all, selected) = KEEP.with(|k| *k.borrow());
     ST.with(|s| {
         *s.borrow_mut() = Some(State {
-            hwnd,
-            list,
-            search,
-            btn_disable_all,
-            btn_profile,
-            btn_sort,
-            btn_edit,
-            btn_more,
-            btn_run,
+            ctl,
             selected,
             view: View::default(),
             flash: None,
@@ -416,214 +525,56 @@ fn on_create(hwnd: HWND) {
             sort,
             show_all,
             told_about_tray: false,
+            laid_out: None,
+            status: (PAD, view_w() - PAD),
+            banner_msg: String::new(),
+            banner_armed: false,
+            banner_laid: 0,
+            sort_w,
+            run_armed: None,
         })
     });
 }
 
-fn dot(hdc: HDC, x: i32, y: i32, filled: bool) {
-    let p = palette();
-    let rad = px(4);
-    let rc = RECT { left: x - rad, top: y - rad, right: x + rad, bottom: y + rad };
-    if filled {
-        unsafe {
-            let b = CreateSolidBrush(p.accent);
-            let pen = CreatePen(PS_SOLID, 1, p.accent);
-            let ob = SelectObject(hdc, b as _);
-            let op = SelectObject(hdc, pen as _);
-            Ellipse(hdc, rc.left, rc.top, rc.right, rc.bottom);
-            SelectObject(hdc, ob);
-            SelectObject(hdc, op);
-            DeleteObject(b as _);
-            DeleteObject(pen as _);
-        }
-    } else {
-        round_rect(hdc, &rc, p.muted, None, 8);
-    }
-}
+// ---------- painting ----------
 
 fn on_paint(hwnd: HWND) {
-    let Some((v, search)) = st(|s| (s.view.clone(), s.search)) else { return };
-    paint(hwnd, |hdc, _| {
-        let p = palette();
-        let f = fonts();
-        let (hh, dy) = (header_h(), body_shift());
-        header_band(hdc, W, hh);
-        text(hdc, "NoKey", &r(24, 10 + dy / 2, 200, 34), f.title, p.text, DT_SINGLELINE | DT_VCENTER);
-        if let Some(star) = p.star {
-            let size = px(hh - 18);
-            let cx = px(24 + 18) + text_width(hdc, "NoKey", f.title) + size / 2;
-            star_of_david(hdc, cx, px(hh / 2), size, star, p.bg);
-        }
-
-        // Discord connection, right-aligned before the Settings button
-        let right = px(W - 24 - 120 - 14);
-        let tw = text_width(hdc, &v.conn_short, f.small);
-        let tr = RECT { left: right - tw, top: px(12 + dy / 2), right, bottom: px(42 + dy / 2) };
-        let color = if v.connected { p.text } else { p.muted };
-        text(hdc, &v.conn_short, &tr, f.small, color, DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
-        dot(hdc, tr.left - px(12), px(27 + dy / 2), v.connected);
-
-        let status = match (&v.emergency_error, v.all_enabled) {
-            (Some(e), _) => format!("⚠ {e}"),
-            (None, true) => t("main.status_enabled"),
-            (None, false) => t("main.status_disabled"),
-        };
-        let status_color = if v.all_enabled { p.muted } else { p.text };
-        text(hdc, &status, &r(24, 112 + dy, W - 48, 18), f.small, status_color, DT_SINGLELINE | DT_CENTER | DT_END_ELLIPSIS);
-
-        edit_frames(hwnd, hdc, &[search]);
-        caption(hdc, &t("main.bindings"), 24, 182 + dy, 260);
-        let count = tf("main.active_count", &[("count", &v.total.to_string())]);
-        text(hdc, &count, &r(W - 224, 182 + dy, 200, 18), f.small, p.muted, DT_SINGLELINE | DT_RIGHT);
-        if v.rows.is_empty() {
-            let area = r(24, 202 + dy, W - 48, 4 * ROW_H);
-            round_rect(hdc, &area, p.line, None, 10);
-            let empty = if crate::win::get_text(search).trim().is_empty() { t("main.empty") } else { t("main.nothing_found") };
-            text(hdc, &empty, &area, f.normal, p.muted, DT_CENTER | DT_VCENTER | DT_WORDBREAK);
-        }
-
-        hline(hdc, 24, 432 + dy, W - 48);
-        caption(hdc, &t("main.selected"), 24, 442 + dy, 300);
-        if v.run_label.is_none() {
-            text(hdc, &t("main.nothing_selected"), &r(24, 462 + dy, W - 48, 20), f.normal, p.muted, DT_SINGLELINE);
-        }
-        for (i, line) in v.detail.iter().enumerate() {
-            let font = if i == 0 { f.normal } else { f.small };
-            let color = if i == 0 { p.text } else { p.muted };
-            text(hdc, line, &r(24, 462 + dy + 20 * i as i32, W - 48, 20), font, color, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-        }
-
-        hline(hdc, 24, 572 + dy, W - 48);
-        caption(hdc, &t("main.status"), 24, 582 + dy, 300);
-        // The value column starts after the longest label (labels differ a lot between languages).
-        let (ping_label, result_label) = (t("main.last_ping"), t("main.result"));
-        let label_w = text_width(hdc, &ping_label, f.small).max(text_width(hdc, &result_label, f.small));
-        let vx = (px(24) + label_w + px(16)).max(px(134));
-        let value = |y: i32, h: i32| RECT { left: vx, top: px(y), right: px(W - 24), bottom: px(y + h) };
-        text(hdc, &ping_label, &r(24, 602 + dy, W - 48, 20), f.small, p.muted, DT_SINGLELINE | DT_VCENTER);
-        text(hdc, &v.last_ping, &value(602 + dy, 20), f.normal, p.text, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-        let result = match &v.last_result {
-            Some((ok, msg)) => format!("{} {msg}", if *ok { "✓" } else { "✕" }),
-            None => t("main.ready"),
-        };
-        text(hdc, &result_label, &r(24, 622 + dy, W - 48, 20), f.small, p.muted, DT_SINGLELINE | DT_VCENTER);
-        text(hdc, &result, &value(622 + dy, 40), f.normal, p.text, DT_WORDBREAK | DT_END_ELLIPSIS);
-    });
+    if super::page::is_open() {
+        // Only the background can show, beside a page that is sliding in.
+        super::paint(hwnd, |hdc, rc| super::fill(hdc, rc, palette().bg));
+        return;
+    }
+    let Some((v, search, flash, status, mut msg)) =
+        st(|s| (s.view.clone(), s.ctl.search, s.flash, s.status, s.banner_msg.clone()))
+    else {
+        return;
+    };
+    let shown = paint::banner_text(&v);
+    if let Some(text) = &shown {
+        msg = text.clone();
+        st(|s| s.banner_msg = msg.clone());
+    }
+    let banner = paint::Banner { height: banner_h(hwnd, shown.is_some()), text: msg };
+    // Each pulse frame repaints only the Discord status area of the header.
+    let dot_area = r(status.0, 0, status.1 - status.0, header_h());
+    let dot_pulse = if v.checking { anim::pulse(hwnd, SLOT_DOT, kit::DOT_PULSE_MS, 0.0, Some(dot_area)) } else { 0.0 };
+    paint(hwnd, |hdc, _| paint::window(hwnd, hdc, &v, search, flash, status, &banner, dot_pulse));
 }
 
 fn draw_row(dis: &DRAWITEMSTRUCT) {
     if dis.itemID == u32::MAX {
         return;
     }
-    let Some(row) = st(|s| s.view.rows.get(dis.itemID as usize).cloned()).flatten() else { return };
-    let hdc = dis.hDC;
-    let rc = dis.rcItem;
-    let p = palette();
-    let f = fonts();
-    let selected = dis.itemState & ODS_SELECTED != 0;
-    fill(hdc, &rc, if selected { p.selected } else { p.surface });
-    if selected {
-        fill(hdc, &RECT { right: rc.left + px(3), ..rc }, p.accent);
+    if let Some(row) = st(|s| s.view.rows.get(dis.itemID as usize).cloned()).flatten() {
+        row::draw(dis, &row);
     }
-    let main_color = if row.enabled { p.text } else { p.muted };
-
-    let icon = RECT { left: rc.left + px(10), top: rc.top + px(8), right: rc.left + px(38), bottom: rc.bottom - px(8) };
-    round_rect(hdc, &icon, p.border, Some(p.bg), 8);
-    text(hdc, &row.icon, &icon, f.bold, main_color, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-    let chip_w = text_width(hdc, &row.chip, f.small) + px(20);
-    let chip = RECT { left: rc.right - px(12) - chip_w, top: rc.top + px(11), right: rc.right - px(12), bottom: rc.bottom - px(11) };
-    let outline = if row.problem || row.paused { p.accent } else { p.border };
-    round_rect(hdc, &chip, outline, Some(p.bg), 8);
-    let chip_text = if row.problem { format!("⚠ {}", row.chip) } else { row.chip.clone() };
-    text(hdc, &chip_text, &chip, f.small, main_color, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-    let text_right = chip.left - px(10);
-    let left = icon.right + px(10);
-    let name_rc = RECT { left, top: rc.top + px(4), right: text_right, bottom: rc.top + px(24) };
-    text(hdc, &row.name, &name_rc, f.bold, main_color, DT_SINGLELINE | DT_END_ELLIPSIS);
-    let sum_rc = RECT { left, top: rc.top + px(23), right: text_right, bottom: rc.bottom - px(3) };
-    text(hdc, &row.summary, &sum_rc, f.small, p.muted, DT_SINGLELINE | DT_END_ELLIPSIS);
-    fill(hdc, &RECT { top: rc.bottom - 1, ..rc }, p.line);
 }
+
+// ---------- commands ----------
 
 fn selected_binding() -> Option<Binding> {
     let id = st(|s| s.selected).flatten()?;
     app::with(|a| a.config.binding(id).cloned())
-}
-
-fn more_menu(hwnd: HWND, anchor: HWND) {
-    let Some(b) = selected_binding() else { return };
-    let paused = st(|s| s.view.selected_paused).unwrap_or(false);
-    let mut items = vec![
-        t("main.duplicate"),
-        t("main.delete"),
-        t(if b.enabled { "main.disable" } else { "main.enable" }),
-        "-".to_string(),
-        t("main.pause_15m"),
-        t("main.pause_1h"),
-        t("main.pause_restart"),
-    ];
-    if paused {
-        items.push(t("main.resume"));
-    }
-    match popup_menu(hwnd, anchor, &items, &[]) {
-        Some(0) => match app::duplicate_binding(b.id) {
-            Ok(id) => select(id),
-            Err(e) => alert(hwnd, &e),
-        },
-        Some(1) => {
-            if confirm(hwnd, &tf("main.confirm_delete", &[("name", &b.name)]))
-                && let Err(e) = app::delete_binding(b.id)
-            {
-                alert(hwnd, &e);
-            }
-        }
-        Some(2) => match app::set_binding_enabled(b.id, !b.enabled) {
-            Ok(Some(problem)) => alert(hwnd, &tf("err.hotkey_taken", &[("details", &problem)])),
-            Ok(None) => {}
-            Err(e) => alert(hwnd, &e),
-        },
-        Some(4) => app::pause_binding(b.id, Some(Duration::from_secs(15 * 60))),
-        Some(5) => app::pause_binding(b.id, Some(Duration::from_secs(60 * 60))),
-        Some(6) => app::pause_binding(b.id, None),
-        Some(7) => app::resume_binding(b.id),
-        _ => {}
-    }
-}
-
-fn profile_menu(hwnd: HWND, anchor: HWND) {
-    let (profiles, active) = app::with(|a| (a.config.profiles.clone(), a.config.active_profile));
-    let mut items: Vec<String> = profiles.iter().map(|p| p.name.clone()).collect();
-    let checked: Vec<usize> = profiles.iter().position(|p| p.id == active).into_iter().collect();
-    items.push("-".into());
-    items.push(t("main.manage_profiles"));
-    match popup_menu(hwnd, anchor, &items, &checked) {
-        Some(i) if i < profiles.len() => app::set_active_profile(profiles[i].id),
-        Some(i) if i == items.len() - 1 => settings::open_tab(hwnd, settings::TAB_PROFILES),
-        _ => {}
-    }
-}
-
-fn sort_menu(hwnd: HWND, anchor: HWND) {
-    let Some((sort, show_all)) = st(|s| (s.sort, s.show_all)) else { return };
-    let mut items: Vec<String> = SORT_KEYS.iter().map(|(_, k)| t(k)).collect();
-    let mut checked: Vec<usize> = SORT_KEYS.iter().position(|(k, _)| *k == sort).into_iter().collect();
-    items.push("-".into());
-    items.push(t("main.show_all_profiles"));
-    if show_all {
-        checked.push(items.len() - 1);
-    }
-    match popup_menu(hwnd, anchor, &items, &checked) {
-        Some(i) if i < SORT_KEYS.len() => {
-            st(|s| s.sort = SORT_KEYS[i].0);
-        }
-        Some(i) if i == items.len() - 1 => {
-            st(|s| s.show_all = !s.show_all);
-        }
-        _ => return,
-    }
-    refresh();
 }
 
 fn hide_to_tray(hwnd: HWND) {
@@ -649,22 +600,24 @@ fn select_at_cursor(list: HWND) {
     }
 }
 
+fn on_list_selchange(list: HWND) {
+    let idx = unsafe { SendMessageW(list, LB_GETCURSEL, 0, 0) };
+    if idx < 0 {
+        return;
+    }
+    let data = unsafe { SendMessageW(list, LB_GETITEMDATA, idx as WPARAM, 0) } as u32;
+    st(|s| {
+        s.selected = Some(data);
+        s.cooling = false;
+        unsafe { KillTimer(s.ctl.hwnd, TIMER_COOLDOWN) };
+    });
+    refresh();
+}
+
 fn on_command(hwnd: HWND, id: i32, code: u32) {
-    let ctl = |f: fn(&State) -> HWND| st(|s| f(s)).unwrap_or(null_mut());
+    let Some(c) = st(|s| s.ctl) else { return };
     match id {
-        ID_LIST if code == LBN_SELCHANGE => {
-            let list = ctl(|s| s.list);
-            let idx = unsafe { SendMessageW(list, LB_GETCURSEL, 0, 0) };
-            if idx >= 0 {
-                let data = unsafe { SendMessageW(list, LB_GETITEMDATA, idx as WPARAM, 0) } as u32;
-                st(|s| {
-                    s.selected = Some(data);
-                    s.cooling = false;
-                    unsafe { KillTimer(s.hwnd, TIMER_COOLDOWN) };
-                });
-                refresh();
-            }
-        }
+        ID_LIST if code == LBN_SELCHANGE => on_list_selchange(c.list),
         ID_LIST if code == LBN_DBLCLK => on_command(hwnd, ID_EDIT, 0),
         ID_SEARCH if code == EN_CHANGE => refresh(),
         ID_SEARCH if code == EN_SETFOCUS || code == EN_KILLFOCUS => invalidate(hwnd),
@@ -674,21 +627,57 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
                 editor::open(hwnd, Some(b));
             }
         }
-        ID_MORE => more_menu(hwnd, ctl(|s| s.btn_more)),
+        ID_MORE => more_menu(hwnd, c.more),
         ID_RUN => {
             if let Some(b) = selected_binding() {
+                st(|s| s.run_armed = anim::by_pointer().then_some(b.id));
                 app::run_binding(b.id);
             }
         }
         ID_SETTINGS => settings::open(hwnd),
-        ID_DISABLE_ALL => app::toggle_all(),
-        ID_PROFILE => profile_menu(hwnd, ctl(|s| s.btn_profile)),
-        ID_SORT => sort_menu(hwnd, ctl(|s| s.btn_sort)),
+        ID_SWITCH => {
+            st(|s| s.banner_armed = anim::by_pointer());
+            app::toggle_all();
+            st(|s| s.banner_armed = false);
+        }
+        ID_PROFILE => profile_menu(hwnd, c.profile),
+        ID_SORT => sort_menu(hwnd, c.sort),
         _ => {}
     }
 }
 
+/// The binding list sits on `bg` (ctl_color would give list boxes `surface`).
+fn list_color(wparam: WPARAM) -> LRESULT {
+    let hdc = wparam as HDC;
+    let p = palette();
+    unsafe {
+        SetTextColor(hdc, p.text);
+        SetBkColor(hdc, p.bg);
+    }
+    theme::bg_brush() as LRESULT
+}
+
+/// WM_TIMER: animation frames, the end of a result flash, the run cooldown.
+fn on_timer(hwnd: HWND, id: usize) {
+    if anim::on_timer(hwnd, id) {
+        on_anim_frame(hwnd);
+        return;
+    }
+    unsafe { KillTimer(hwnd, id) };
+    match id {
+        TIMER_FLASH => end_flash(),
+        TIMER_COOLDOWN => {
+            st(|s| s.cooling = false);
+        }
+        _ => {}
+    }
+    refresh();
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == WM_CTLCOLORLISTBOX {
+        return list_color(wparam);
+    }
     if let Some(r) = ctl_color(msg, wparam) {
         return r;
     }
@@ -702,6 +691,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             0
         }
         WM_ERASEBKGND => 1,
+        WM_GETMINMAXINFO => {
+            let info = unsafe { &mut *(lparam as *mut MINMAXINFO) };
+            let (w, h) = super::window_size(super::page::MIN_W, super::page::MIN_H);
+            info.ptMinTrackSize.x = w;
+            info.ptMinTrackSize.y = h;
+            0
+        }
+        WM_SIZE => {
+            if wparam as u32 != SIZE_MINIMIZED && st(|_| ()).is_some() {
+                super::page::resized((lparam & 0xFFFF) as i32, ((lparam >> 16) & 0xFFFF) as i32);
+            }
+            0
+        }
         WM_MEASUREITEM => {
             let mis = unsafe { &mut *(lparam as *mut MEASUREITEMSTRUCT) };
             mis.itemHeight = px(ROW_H) as u32;
@@ -722,7 +724,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             0
         }
         WM_CONTEXTMENU => {
-            let list = st(|s| s.list).unwrap_or(null_mut());
+            let list = st(|s| s.ctl.list).unwrap_or(null_mut());
             if wparam as HWND == list {
                 select_at_cursor(list);
                 more_menu(hwnd, list);
@@ -730,14 +732,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             0
         }
         WM_TIMER => {
-            unsafe { KillTimer(hwnd, wparam) };
-            st(|s| match wparam {
-                TIMER_FLASH => s.flash = None,
-                TIMER_COOLDOWN => s.cooling = false,
-                _ => {}
-            });
-            refresh();
+            on_timer(hwnd, wparam);
             0
+        }
+        WM_NCDESTROY => {
+            anim::forget(hwnd);
+            def(hwnd, msg, wparam, lparam)
         }
         WM_SYSCOMMAND if (wparam & 0xFFF0) as u32 == SC_MINIMIZE => {
             if app::with(|a| a.config.minimize_to_tray) {
@@ -750,7 +750,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_CLOSE => {
             if app::with(|a| a.config.minimize_to_tray) {
                 hide_to_tray(hwnd);
-            } else {
+            } else if super::page::go_home() {
+                // False: the user keeps an edited binding open.
                 app::exit();
             }
             0

@@ -1,9 +1,13 @@
 //! Settings with four tabs: General (theme, language, startup, timing),
-//! Discord, Profiles and Updates.
+//! Discord, Profiles and Updates. Layout follows docs/DESIGN.md: header bar,
+//! tabs, sentence-case captions, switch rows and a bottom action bar. All
+//! coordinates are 96-DPI units from the left (Hebrew windows mirror).
+//! Motion: the tab underline slides after a click, switches slide, the
+//! profile-switch Record button pulses while recording.
 
 use super::theme::palette;
 use super::*;
-use crate::app::{self, is_builtin_profile, TaskResult};
+use crate::app::{self, is_builtin_profile, Conn, TaskResult};
 use crate::config::{
     timing, Language, Theme, COMBO_WINDOW_RANGE, COOLDOWN_RANGE_MS, DOUBLE_TAP_RANGE, LONG_PRESS_RANGE,
     SEQUENCE_TIMEOUT_RANGE,
@@ -17,9 +21,46 @@ use std::cell::RefCell;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 
+mod view;
+
 const CLASS: &str = "NoKeySettings";
-const W: i32 = 540;
-const H: i32 = 600;
+fn view_w() -> i32 {
+    page::width()
+}
+// Fits a 1080p screen at 150 % (client 924 px + frame) with room to spare.
+fn view_h() -> i32 {
+    page::height()
+}
+const PAD: i32 = 16;
+fn content_w() -> i32 {
+    view_w() - 2 * PAD
+}
+const HEADER_H: i32 = 52;
+const TAB_H: i32 = 36;
+/// First caption of every tab: 16 below the tab strip.
+const TOP: i32 = HEADER_H + TAB_H + 16;
+const BAR_H: i32 = 56;
+fn bar_y() -> i32 {
+    view_h() - BAR_H
+}
+const BTN_H: i32 = 32;
+/// Field frame height (edit 20 + 8 padding above and below).
+const FIELD_H: i32 = 36;
+const SWITCH_Y: i32 = 168;
+const SWITCH_ROW: i32 = 30;
+/// Switch button width; its pill ends 2px inside, i.e. on the right padding.
+const SWITCH_BTN_W: i32 = 44;
+const TIMING_Y: i32 = 312;
+const NUM_GAP: i32 = 16;
+fn num_w() -> i32 {
+    (content_w() - 2 * NUM_GAP) / 3
+}
+/// Vertical stride of the timing grid: two-line label + gap + field + gap.
+const NUM_ROW: i32 = 84;
+const NUM_LABEL_H: i32 = 32;
+const LIST_ROW: i32 = 40;
+/// Animation slot (settings window): the pulsing Discord status dot.
+const SLOT_DOT: u32 = 1;
 
 pub const TAB_GENERAL: usize = 0;
 pub const TAB_DISCORD: usize = 1;
@@ -51,13 +92,14 @@ const ID_CLOSE: i32 = 461;
 const IDCANCEL_KEY: i32 = 2;
 
 const TOGGLES: [&str; 4] = ["settings.start_with_windows", "settings.minimize_to_tray", "settings.launch_minimized", "settings.notifications"];
-/// (label key, x, y) of the timing fields: cooldown is in seconds, the rest in ms.
-const NUMS: [(&str, i32, i32); 5] = [
-    ("settings.cooldown", 24, 286),
-    ("settings.combo_window", 190, 286),
-    ("settings.sequence_timeout", 356, 286),
-    ("settings.double_tap", 24, 358),
-    ("settings.long_press", 190, 358),
+/// (label key, tooltip key, column, row) of the timing fields: cooldown is in
+/// seconds, the rest in ms.
+const NUMS: [(&str, &str, i32, i32); 5] = [
+    ("settings.cooldown", "tip.global_cooldown", 0, 0),
+    ("settings.combo_window", "tip.combo_window", 1, 0),
+    ("settings.sequence_timeout", "tip.sequence_timeout", 2, 0),
+    ("settings.double_tap", "tip.double_tap", 0, 1),
+    ("settings.long_press", "tip.long_press", 1, 1),
 ];
 
 struct Se {
@@ -76,6 +118,8 @@ struct Se {
     profile_ids: Vec<u32>,
     profile_name: HWND,
     switch_record: HWND,
+    /// Room left of Record/Clear for the shortcut keycaps (96-DPI units).
+    shortcut_w: i32,
     recording: bool,
     switch_info: String,
     repo: HWND,
@@ -111,122 +155,27 @@ pub fn open(owner: HWND) {
     open_tab(owner, TAB_GENERAL);
 }
 
-pub fn open_tab(owner: HWND, tab: usize) {
-    if se(|s| s.hwnd).is_none() {
-        let hwnd = create_window(CLASS, &t("settings.title"), W, H, owner);
-        if hwnd.is_null() {
+pub fn open_tab(main: HWND, tab: usize) {
+    let open = se(|s| s.hwnd).is_some();
+    if !open && !page::go_home() {
+        return;
+    }
+    main_window::show_main();
+    if !open {
+        if page::create(CLASS, main).is_null() {
             return;
         }
         load();
     }
     se(|s| s.tab = tab);
     layout();
-    let h = hwnd();
-    unsafe {
-        ShowWindow(h, SW_SHOW);
-        SetForegroundWindow(h);
+    if !open {
+        page::show_page(hwnd());
     }
 }
 
 fn comma() -> bool {
     i18n::language().decimal_comma()
-}
-
-fn on_create(hwnd: HWND) {
-    let b = |id, text: &str, kind, x, y, w, h| {
-        let btn = button(hwnd, id, text, kind);
-        place(btn, x, y, w, h);
-        btn
-    };
-    let e = |id, style, x, y, w| {
-        let ed = edit(hwnd, id, style);
-        place(ed, x, y, w, 20);
-        ed
-    };
-    let tab_w = (W - 48) / 4;
-    let tabs: [HWND; 4] =
-        std::array::from_fn(|i| b(ID_TAB + i as i32, &t(TAB_KEYS[i]), BTN_TAB, 24 + tab_w * i as i32, 8, tab_w, 40));
-
-    // General
-    let theme_btn = b(ID_THEME, "", BTN_DROPDOWN, 24, 82, 230, 32);
-    let language_btn = b(ID_LANGUAGE, "", BTN_DROPDOWN, 286, 82, 230, 32);
-    let toggles: [HWND; 4] =
-        std::array::from_fn(|i| b(ID_TOGGLE + i as i32, &t(TOGGLES[i]), BTN_TOGGLE, 24, 130 + 30 * i as i32, W - 48, 26));
-    let nums: [HWND; 5] = std::array::from_fn(|i| {
-        let (_, x, y) = NUMS[i];
-        e(ID_NUM + i as i32, 0, x + 10, y + 28, 130)
-    });
-    let mut general = vec![theme_btn, language_btn];
-    general.extend(toggles);
-    general.extend(nums);
-
-    // Discord
-    let token = e(ID_TOKEN, ES_PASSWORD as u32, 34, 90, W - 68);
-    set_cue(token, &t("settings.token_cue"));
-    let btn_connect = b(ID_CONNECT, &t("settings.connect"), BTN_PRIMARY, 24, 130, 140, 32);
-    let btn_disconnect = b(ID_DISCONNECT, &t("settings.disconnect"), BTN_SECONDARY, 172, 130, 140, 32);
-    let discord = vec![token, btn_connect, btn_disconnect];
-
-    // Profiles
-    let profiles = listbox(hwnd, ID_PROFILES, 0);
-    place(profiles, 24, 82, W - 48, 150);
-    let profile_name = e(ID_PROFILE_NAME, 0, 34, 248, W - 68);
-    set_cue(profile_name, &t("settings.profile_name_cue"));
-    let p_buttons = [
-        b(ID_P_ADD, &t("settings.profile_add"), BTN_SECONDARY, 24, 288, 110, 30),
-        b(ID_P_RENAME, &t("settings.profile_rename"), BTN_SECONDARY, 142, 288, 120, 30),
-        b(ID_P_DUPLICATE, &t("settings.profile_duplicate"), BTN_SECONDARY, 270, 288, 120, 30),
-        b(ID_P_DELETE, &t("settings.profile_delete"), BTN_SECONDARY, 398, 288, 118, 30),
-        b(ID_P_ACTIVATE, &t("settings.profile_activate"), BTN_PRIMARY, 24, 328, 200, 30),
-    ];
-    let switch_record = b(ID_SWITCH_RECORD, &t("editor.record"), BTN_SECONDARY, 24, 428, 130, 30);
-    let switch_clear = b(ID_SWITCH_CLEAR, &t("settings.clear"), BTN_SECONDARY, 162, 428, 110, 30);
-    let mut profiles_group = vec![profiles, profile_name, switch_record, switch_clear];
-    profiles_group.extend(p_buttons);
-
-    // Updates
-    let repo = e(ID_REPO, 0, 34, 134, 320);
-    set_cue(repo, "owner/repository");
-    let btn_check = b(ID_CHECK, &t("settings.check_updates"), BTN_SECONDARY, 376, 126, 140, 36);
-    let updates = vec![repo, btn_check];
-
-    b(ID_SAVE, &t("common.save"), BTN_PRIMARY, 24, 548, 140, 36);
-    b(ID_CLOSE, &t("common.close"), BTN_SECONDARY, 172, 548, 120, 36);
-
-    add_tooltip(hwnd, nums[0], &t("tip.global_cooldown"));
-    add_tooltip(hwnd, nums[1], &t("tip.combo_window"));
-    add_tooltip(hwnd, nums[2], &t("tip.sequence_timeout"));
-    add_tooltip(hwnd, nums[3], &t("tip.double_tap"));
-    add_tooltip(hwnd, nums[4], &t("tip.long_press"));
-    add_tooltip(hwnd, theme_btn, &t("tip.theme"));
-    add_tooltip(hwnd, switch_record, &t("tip.profile_switch"));
-
-    let mut edits = nums.to_vec();
-    edits.extend([token, profile_name, repo]);
-    SE.with(|s| {
-        *s.borrow_mut() = Some(Se {
-            hwnd,
-            tab: TAB_GENERAL,
-            tabs,
-            groups: [general, discord, profiles_group, updates],
-            edits,
-            theme_btn,
-            language_btn,
-            toggles,
-            nums,
-            token,
-            btn_disconnect,
-            profiles,
-            profile_ids: Vec::new(),
-            profile_name,
-            switch_record,
-            recording: false,
-            switch_info: String::new(),
-            repo,
-            btn_check,
-            update_status: String::new(),
-        })
-    });
 }
 
 fn load() {
@@ -275,6 +224,7 @@ pub fn refresh() {
     set_text(language_btn, language.native_name());
     let selected = selected_profile();
     unsafe {
+        super::kit::reset_list_hover(list);
         SendMessageW(list, LB_RESETCONTENT, 0, 0);
         for p in &profiles {
             SendMessageW(list, LB_ADDSTRING, 0, p.id as LPARAM);
@@ -293,105 +243,6 @@ fn selected_profile() -> Option<u32> {
         return None;
     }
     ids.get(idx as usize).copied()
-}
-
-fn paint_general(hdc: HDC) {
-    let p = palette();
-    let f = fonts();
-    caption(hdc, &t("settings.theme"), 24, 60, 230);
-    caption(hdc, &t("settings.language"), 286, 60, 230);
-    caption(hdc, &t("settings.timing"), 24, 262, 300);
-    for (key, x, y) in NUMS {
-        text(hdc, &t(key), &r(x, y, 160, 18), f.small, p.muted, DT_SINGLELINE | DT_END_ELLIPSIS);
-    }
-    text(hdc, &t("settings.timing_hint"), &r(24, 426, W - 48, 40), f.small, p.muted, DT_WORDBREAK);
-}
-
-fn paint_discord(hdc: HDC) {
-    let p = palette();
-    let f = fonts();
-    let (conn_line, masked) = app::with(|a| (a.conn.line(), a.token.as_deref().map(mask)));
-    caption(hdc, &t("settings.discord_bot"), 24, 60, 300);
-    text(hdc, &conn_line, &r(24, 176, W - 48, 20), f.bold, p.text, DT_SINGLELINE | DT_END_ELLIPSIS);
-    let note = match masked {
-        Some(m) => tf("settings.token_saved", &[("mask", &m)]),
-        None => t("settings.token_note"),
-    };
-    text(hdc, &note, &r(24, 198, W - 48, 18), f.small, p.muted, DT_SINGLELINE | DT_END_ELLIPSIS);
-    text(hdc, &t("settings.discord_help"), &r(24, 232, W - 48, 60), f.small, p.muted, DT_WORDBREAK);
-}
-
-fn paint_profiles(hdc: HDC, switch_info: &str, recording: bool) {
-    let p = palette();
-    let f = fonts();
-    let switch = app::with(|a| a.config.profile_switch.as_ref().map(|s| s.label()));
-    caption(hdc, &t("settings.profiles"), 24, 60, 300);
-    caption(hdc, &t("settings.profile_switch"), 24, 378, 400);
-    let current = if recording {
-        t("editor.press_keys")
-    } else {
-        switch.unwrap_or_else(|| t("settings.not_set"))
-    };
-    text(hdc, &current, &r(24, 398, W - 48, 24), f.bold, p.text, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-    text(hdc, switch_info, &r(24, 466, W - 48, 34), f.small, p.muted, DT_WORDBREAK | DT_END_ELLIPSIS);
-}
-
-fn paint_updates(hdc: HDC, status: &str) {
-    let p = palette();
-    let f = fonts();
-    caption(hdc, &t("settings.updates"), 24, 60, 300);
-    let ver = tf("settings.installed_version", &[("version", CURRENT_VERSION)]);
-    text(hdc, &ver, &r(24, 82, W - 48, 18), f.normal, p.text, DT_SINGLELINE);
-    caption(hdc, &t("settings.repo"), 24, 108, 300);
-    text(hdc, status, &r(24, 176, W - 48, 40), f.small, p.text, DT_WORDBREAK | DT_END_ELLIPSIS);
-    text(hdc, &t("settings.update_help"), &r(24, 230, W - 48, 60), f.small, p.muted, DT_WORDBREAK);
-}
-
-fn on_paint(hwnd: HWND) {
-    let Some((tab, edits, status, switch_info, recording)) =
-        se(|s| (s.tab, s.edits.clone(), s.update_status.clone(), s.switch_info.clone(), s.recording))
-    else {
-        return;
-    };
-    paint(hwnd, |hdc, _| {
-        header_band(hdc, W, 52);
-        edit_frames(hwnd, hdc, &edits);
-        match tab {
-            TAB_GENERAL => paint_general(hdc),
-            TAB_DISCORD => paint_discord(hdc),
-            TAB_PROFILES => paint_profiles(hdc, &switch_info, recording),
-            _ => paint_updates(hdc, &status),
-        }
-    });
-}
-
-fn draw_profile_row(dis: &DRAWITEMSTRUCT) {
-    if dis.itemID == u32::MAX {
-        return;
-    }
-    let Some(id) = se(|s| s.profile_ids.get(dis.itemID as usize).copied()).flatten() else { return };
-    let (name, active, count) = app::with(|a| {
-        let name = a.config.profile(id).map(|p| p.name.clone()).unwrap_or_default();
-        let count = a.config.bindings.iter().filter(|b| b.profile == id).count();
-        (name, a.config.active_profile == id, count)
-    });
-    let p = palette();
-    let f = fonts();
-    let rc = dis.rcItem;
-    let selected = dis.itemState & ODS_SELECTED != 0;
-    fill(dis.hDC, &rc, if selected { p.selected } else { p.surface });
-    if selected {
-        fill(dis.hDC, &RECT { right: rc.left + px(3), ..rc }, p.accent);
-    }
-    let mark = if active { "✓ " } else { "" };
-    let left = RECT { left: rc.left + px(12), right: rc.right - px(180), ..rc };
-    text(dis.hDC, &format!("{mark}{name}"), &left, f.bold, p.text, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-    let mut note = tf("settings.profile_bindings", &[("count", &count.to_string())]);
-    if is_builtin_profile(id) {
-        note = format!("{} · {note}", t("settings.profile_builtin"));
-    }
-    let right = RECT { left: rc.right - px(180), right: rc.right - px(10), ..rc };
-    text(dis.hDC, &note, &right, f.small, p.muted, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_END_ELLIPSIS);
 }
 
 // ---------- Discord ----------
@@ -483,6 +334,7 @@ fn toggle_switch_recording() {
 fn update_switch_button() {
     if let Some((btn, recording, hwnd)) = se(|s| (s.switch_record, s.recording, s.hwnd)) {
         set_text(btn, &t(if recording { "editor.stop" } else { "editor.record" }));
+        kit::set_pulsing(btn, recording);
         invalidate(hwnd);
     }
 }
@@ -638,6 +490,30 @@ pub fn close() {
     let Some(hwnd) = se(|s| s.hwnd) else { return };
     SE.with(|s| *s.borrow_mut() = None);
     unsafe { DestroyWindow(hwnd) };
+    page::closed();
+}
+
+/// The window changed size.
+pub fn resize(by: page::Resize) {
+    let Some((hwnd, toggles, columns, wide)) = se(|s| {
+        s.shortcut_w += view_w() - by.old_width;
+        let columns = (s.theme_btn, s.language_btn, s.nums);
+        (s.hwnd, s.toggles, columns, [s.token, s.profiles, s.profile_name, s.repo])
+    }) else {
+        return;
+    };
+    let item = |id| unsafe { GetDlgItem(hwnd, id) };
+    let bar = [item(ID_CLOSE), item(ID_SAVE)];
+    let mut right = toggles.to_vec();
+    right.extend(
+        [ID_CONNECT, ID_DISCONNECT, ID_P_ADD, ID_P_RENAME, ID_P_DUPLICATE, ID_P_DELETE, ID_SWITCH_RECORD]
+            .into_iter()
+            .chain([ID_SWITCH_CLEAR, ID_CHECK])
+            .map(item),
+    );
+    right.extend(bar);
+    page::anchor(hwnd, by, &right, &wide, &bar);
+    view::place_columns(columns.0, columns.1, columns.2);
 }
 
 pub fn dialog_message(msg: &MSG) -> bool {
@@ -647,13 +523,20 @@ pub fn dialog_message(msg: &MSG) -> bool {
     }
 }
 
+/// A tab button was clicked: the underline slides when the mouse did it.
+fn click_tab(hwnd: HWND, new: usize) {
+    if let Some((old, tabs)) = se(|s| (std::mem::replace(&mut s.tab, new), s.tabs))
+        && anim::by_pointer()
+    {
+        kit::slide_tab(hwnd, tabs[old], tabs[new]);
+    }
+    layout();
+}
+
 fn on_command(id: i32, code: u32) {
     let Some(hwnd) = se(|s| s.hwnd) else { return };
     match id {
-        _ if (ID_TAB..ID_TAB + 4).contains(&id) => {
-            se(|s| s.tab = (id - ID_TAB) as usize);
-            layout();
-        }
+        _ if (ID_TAB..ID_TAB + 4).contains(&id) => click_tab(hwnd, (id - ID_TAB) as usize),
         ID_THEME => {
             let Some(btn) = se(|s| s.theme_btn) else { return };
             let current = app::with(|a| a.config.theme);
@@ -706,35 +589,62 @@ fn on_command(id: i32, code: u32) {
         }
         ID_CHECK => check_updates(),
         ID_SAVE => save(),
-        ID_CLOSE | IDCANCEL_KEY => close(),
+        ID_CLOSE | IDCANCEL_KEY | page::ID_HOME => close(),
         _ if code == EN_SETFOCUS || code == EN_KILLFOCUS => invalidate(hwnd),
         _ => {}
     }
 }
 
+/// A click on a switch row's label toggles its switch (bigger hit area).
+/// Client coordinates are already mirrored in Hebrew, so left-based rows work.
+fn on_click(lparam: LPARAM) {
+    let (x, y) = ((lparam & 0xFFFF) as i16 as i32, ((lparam >> 16) & 0xFFFF) as i16 as i32);
+    let Some((tab, toggles)) = se(|s| (s.tab, s.toggles)) else { return };
+    if tab != TAB_GENERAL || x < px(PAD) || x >= px(view_w() - PAD - SWITCH_BTN_W) || y < px(SWITCH_Y) {
+        return;
+    }
+    let row = ((y - px(SWITCH_Y)) / px(SWITCH_ROW)) as usize;
+    if let Some(&btn) = toggles.get(row) {
+        kit::toggle_animated(btn);
+    }
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // The profile list sits on the window background (rows draw their own fills).
+    if msg == WM_CTLCOLORLISTBOX && unsafe { GetDlgCtrlID(lparam as HWND) } == ID_PROFILES {
+        let p = palette();
+        unsafe {
+            SetTextColor(wparam as HDC, p.text);
+            SetBkColor(wparam as HDC, p.bg);
+        }
+        return super::theme::bg_brush() as LRESULT;
+    }
     if let Some(r) = ctl_color(msg, wparam) {
         return r;
     }
     match msg {
         WM_CREATE => {
-            on_create(hwnd);
+            view::on_create(hwnd);
             0
         }
         WM_PAINT => {
-            on_paint(hwnd);
+            view::on_paint(hwnd);
             0
         }
         WM_ERASEBKGND => 1,
         WM_MEASUREITEM => {
             let mis = unsafe { &mut *(lparam as *mut MEASUREITEMSTRUCT) };
-            mis.itemHeight = px(30) as u32;
+            mis.itemHeight = px(LIST_ROW) as u32;
             1
+        }
+        WM_LBUTTONDOWN => {
+            on_click(lparam);
+            0
         }
         WM_DRAWITEM => {
             let dis = unsafe { &*(lparam as *const DRAWITEMSTRUCT) };
             if dis.CtlType == ODT_LISTBOX {
-                draw_profile_row(dis);
+                view::draw_profile_row(dis);
             } else {
                 draw_button(dis);
             }
@@ -745,9 +655,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             on_command(id, code);
             0
         }
+        WM_TIMER if anim::on_timer(hwnd, wparam) => {
+            page::on_frame(hwnd);
+            0
+        }
         WM_CLOSE => {
             close();
             0
+        }
+        WM_NCDESTROY => {
+            anim::forget(hwnd);
+            def(hwnd, msg, wparam, lparam)
         }
         _ => def(hwnd, msg, wparam, lparam),
     }

@@ -75,7 +75,7 @@ pub fn pick_file(owner: HWND, filter: &[(&str, &str)]) -> Option<String> {
     let mut buf = vec![0u16; 1024];
     let mut ofn: OPENFILENAMEW = unsafe { std::mem::zeroed() };
     ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
-    ofn.hwndOwner = owner;
+    ofn.hwndOwner = super::root(owner);
     ofn.lpstrFilter = filter_w.as_ptr();
     ofn.lpstrFile = buf.as_mut_ptr();
     ofn.nMaxFile = buf.len() as u32;
@@ -91,7 +91,7 @@ pub fn pick_file(owner: HWND, filter: &[(&str, &str)]) -> Option<String> {
 pub fn pick_folder(owner: HWND) -> Option<String> {
     let title = wide("Choose a folder");
     let mut bi: BROWSEINFOW = unsafe { std::mem::zeroed() };
-    bi.hwndOwner = owner;
+    bi.hwndOwner = super::root(owner);
     bi.lpszTitle = title.as_ptr();
     bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
     unsafe {

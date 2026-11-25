@@ -2,9 +2,13 @@
 //! for input; buttons and text are owner-drawn with the current theme.
 //! Every visible string comes from `i18n`.
 
+pub mod anim;
+mod button;
 pub mod editor;
 pub mod host;
+pub mod kit;
 pub mod main_window;
+pub mod page;
 pub mod settings;
 pub mod theme;
 
@@ -14,6 +18,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ptr::{null, null_mut};
 use std::sync::OnceLock;
+pub use button::draw_button;
 use theme::palette;
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::*;
@@ -29,10 +34,12 @@ pub struct Fonts {
     pub small: HFONT,
     pub bold: HFONT,
     pub big: HFONT,
+    /// Keycap labels.
+    pub caps: HFONT,
 }
 
 // GDI handles are process-wide; storing them as usize keeps OnceLock happy.
-struct FontHandles([usize; 5]);
+struct FontHandles([usize; 6]);
 static FONTS: OnceLock<FontHandles> = OnceLock::new();
 
 fn font(size: i32, weight: i32) -> HFONT {
@@ -60,15 +67,16 @@ fn font(size: i32, weight: i32) -> HFONT {
 pub fn fonts() -> Fonts {
     let h = FONTS.get_or_init(|| {
         FontHandles([
-            font(22, FW_SEMIBOLD as i32) as usize,
+            font(18, FW_SEMIBOLD as i32) as usize,
             font(14, FW_NORMAL as i32) as usize,
             font(12, FW_NORMAL as i32) as usize,
             font(14, FW_SEMIBOLD as i32) as usize,
-            font(22, FW_BOLD as i32) as usize,
+            font(16, FW_SEMIBOLD as i32) as usize,
+            font(11, FW_SEMIBOLD as i32) as usize,
         ])
     });
     let p = |i: usize| h.0[i] as *mut core::ffi::c_void;
-    Fonts { title: p(0), normal: p(1), small: p(2), bold: p(3), big: p(4) }
+    Fonts { title: p(0), normal: p(1), small: p(2), bold: p(3), big: p(4), caps: p(5) }
 }
 
 // ---------- window helpers ----------
@@ -96,14 +104,25 @@ pub fn register_class(name: &str, proc: WNDPROC, icon: HICON) {
     unsafe { RegisterClassExW(&wc) };
 }
 
-/// Creates a fixed-size top-level window whose client area is `w` x `h`
-/// (96-DPI units), centered on the work area. Hebrew mirrors the layout.
-pub fn create_window(class: &str, title: &str, w: i32, h: i32, owner: HWND) -> HWND {
-    let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
+/// Style of the main window: resizable, with a maximize button.
+const MAIN_STYLE: WINDOW_STYLE =
+    WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME | WS_CLIPCHILDREN;
+
+/// Outer size (device pixels) of a window whose client area is `w` x `h`
+/// (96-DPI units).
+pub fn window_size(w: i32, h: i32) -> (i32, i32) {
     let ex = if is_rtl() { WS_EX_LAYOUTRTL } else { 0 };
     let mut rc = RECT { left: 0, top: 0, right: px(w), bottom: px(h) };
-    unsafe { AdjustWindowRectEx(&mut rc, style, 0, ex) };
-    let (ww, wh) = (rc.right - rc.left, rc.bottom - rc.top);
+    unsafe { AdjustWindowRectEx(&mut rc, MAIN_STYLE, 0, ex) };
+    (rc.right - rc.left, rc.bottom - rc.top)
+}
+
+/// Creates the top-level window with a client area of `w` x `h` (96-DPI
+/// units), centered on the work area. Hebrew mirrors the layout.
+pub fn create_window(class: &str, title: &str, w: i32, h: i32, owner: HWND) -> HWND {
+    let style = MAIN_STYLE;
+    let ex = if is_rtl() { WS_EX_LAYOUTRTL } else { 0 };
+    let (ww, wh) = window_size(w, h);
     let mut work = RECT { left: 0, top: 0, right: 1280, bottom: 800 };
     unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut work as *mut RECT as *mut _, 0) };
     let x = work.left + ((work.right - work.left) - ww) / 2;
@@ -169,6 +188,12 @@ pub const BTN_DROPDOWN: isize = 4;
 pub const BTN_TAB: isize = 5;
 /// Warning style (the "Enable all binds" state).
 pub const BTN_WARN: isize = 6;
+/// Square ghost button with one glyph (⚙, ⋯).
+pub const BTN_ICON: isize = 7;
+/// Pill switch; "checked" = on.
+pub const BTN_SWITCH: isize = 8;
+/// The "NoKey" header button of a page (text only, underline on hover).
+pub const BTN_LOGO: isize = 9;
 const BTN_CHECKED: isize = 0x100;
 const KIND_MASK: isize = 0xFF;
 
@@ -199,19 +224,30 @@ fn child(parent: HWND, class: &str, text: &str, style: u32, id: i32) -> HWND {
 pub fn button(parent: HWND, id: i32, text: &str, kind: isize) -> HWND {
     let hwnd = child(parent, "BUTTON", text, WS_TABSTOP | BS_OWNERDRAW as u32, id);
     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, kind) };
+    kit::track_button_hover(hwnd);
     hwnd
 }
 
 pub fn set_kind(btn: HWND, kind: isize) {
     unsafe {
-        let checked = GetWindowLongPtrW(btn, GWLP_USERDATA) & BTN_CHECKED;
-        SetWindowLongPtrW(btn, GWLP_USERDATA, kind | checked);
+        let keep = GetWindowLongPtrW(btn, GWLP_USERDATA) & (BTN_CHECKED | kit::BTN_KIT_BITS);
+        SetWindowLongPtrW(btn, GWLP_USERDATA, kind | keep);
         InvalidateRect(btn, null(), 0);
     }
 }
 
 pub fn edit(parent: HWND, id: i32, extra_style: u32) -> HWND {
     child(parent, "EDIT", "", WS_TABSTOP | ES_AUTOHSCROLL as u32 | extra_style, id)
+}
+
+/// Multi-line, word-wrapping edit box (Enter = new line) with a themed
+/// vertical scroll bar. Windows has no cue banner for these.
+pub fn edit_multiline(parent: HWND, id: i32) -> HWND {
+    let style = WS_TABSTOP | WS_VSCROLL | (ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL) as u32;
+    let hwnd = child(parent, "EDIT", "", style, id);
+    let theme_name = wide(if palette().dark { "DarkMode_Explorer" } else { "Explorer" });
+    unsafe { SetWindowTheme(hwnd, theme_name.as_ptr(), null()) };
+    hwnd
 }
 
 pub fn set_cue(edit: HWND, text: &str) {
@@ -232,6 +268,10 @@ pub fn is_checked(btn: HWND) -> bool {
 }
 
 pub fn set_checked(btn: HWND, on: bool) {
+    if !anim::by_pointer() {
+        // A programmatic change (load, refresh, hotkey) snaps; clicks animate.
+        anim::cancel(btn, kit::SLOT_ON);
+    }
     unsafe {
         let v = GetWindowLongPtrW(btn, GWLP_USERDATA) & !BTN_CHECKED;
         SetWindowLongPtrW(btn, GWLP_USERDATA, if on { v | BTN_CHECKED } else { v });
@@ -341,6 +381,23 @@ pub fn text(hdc: HDC, s: &str, rc: &RECT, font: HFONT, color: COLORREF, flags: D
     }
 }
 
+/// Device pixels -> 96-DPI layout units (the inverse of `px`, rounded up so
+/// a measured label never ends up a pixel too narrow).
+pub fn units(device: i32) -> i32 {
+    let hundred = px(100).max(1);
+    (device * 100 + hundred - 1) / hundred
+}
+
+/// Width of `s` in `font`, in 96-DPI layout units (for `place`/`r`).
+pub fn measure_text(hwnd: HWND, s: &str, font: HFONT) -> i32 {
+    unsafe {
+        let hdc = GetDC(hwnd);
+        let w = text_width(hdc, s, font);
+        ReleaseDC(hwnd, hdc);
+        units(w)
+    }
+}
+
 pub fn text_width(hdc: HDC, s: &str, font: HFONT) -> i32 {
     if s.is_empty() {
         return 0;
@@ -378,9 +435,21 @@ pub fn hline(hdc: HDC, x: i32, y: i32, w: i32) {
     fill(hdc, &r(x, y, w, 1), palette().line);
 }
 
-/// Small upper-case section label.
+/// Small sentence-case section label.
 pub fn caption(hdc: HDC, s: &str, x: i32, y: i32, w: i32) {
-    text(hdc, &s.to_uppercase(), &r(x, y, w, 18), fonts().small, palette().muted, DT_SINGLELINE | DT_LEFT);
+    text(hdc, &sentence_case(s), &r(x, y, w, 18), fonts().small, palette().muted, DT_SINGLELINE | DT_LEFT | DT_END_ELLIPSIS);
+}
+
+/// "BINDINGS" -> "Bindings", "bindings" -> "Bindings"; mixed case such as
+/// "GitHub repo" keeps its inner capitals (captions were upper case before 0.3).
+pub fn sentence_case(s: &str) -> String {
+    let shouting = !s.chars().any(char::is_lowercase);
+    let base = if shouting { s.to_lowercase() } else { s.to_string() };
+    let mut chars = base.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 /// Window header background. The Jewish theme adds a lattice of
@@ -472,75 +541,6 @@ pub fn edit_frames(parent: HWND, hdc: HDC, edits: &[HWND]) {
     }
 }
 
-/// Paints an owner-drawn button.
-pub fn draw_button(dis: &DRAWITEMSTRUCT) {
-    let hdc = dis.hDC;
-    let rc = dis.rcItem;
-    let raw = unsafe { GetWindowLongPtrW(dis.hwndItem, GWLP_USERDATA) };
-    let checked = raw & BTN_CHECKED != 0;
-    let kind = raw & KIND_MASK;
-    let pressed = dis.itemState & ODS_SELECTED != 0;
-    let disabled = dis.itemState & ODS_DISABLED != 0;
-    let focused = dis.itemState & ODS_FOCUS != 0;
-    let p = palette();
-    let f = fonts();
-    let label = crate::win::get_text(dis.hwndItem);
-
-    fill(hdc, &rc, p.bg);
-    if kind == BTN_TOGGLE {
-        let size = px(18);
-        let top = rc.top + (rc.bottom - rc.top - size) / 2;
-        let bx = RECT { left: rc.left, top, right: rc.left + size, bottom: top + size };
-        let on = checked != pressed;
-        let outline = if disabled { p.line } else if on || focused { p.accent } else { p.border };
-        round_rect(hdc, &bx, outline, Some(if on { p.accent } else { p.bg }), 5);
-        if on {
-            text(hdc, "✓", &bx, f.bold, p.accent_text, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        }
-        let tr = RECT { left: bx.right + px(10), ..rc };
-        let color = if disabled { p.muted } else { p.text };
-        text(hdc, &label, &tr, f.normal, color, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        return;
-    }
-    if kind == BTN_TAB {
-        let color = if checked { p.text } else { p.muted };
-        text(hdc, &label, &rc, f.bold, color, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        if checked {
-            fill(hdc, &RECT { top: rc.bottom - px(3), ..rc }, p.accent);
-        } else {
-            fill(hdc, &RECT { top: rc.bottom - px(1), ..rc }, p.line);
-        }
-        return;
-    }
-
-    let (bg, fg, outline) = match (kind, pressed, disabled) {
-        (_, _, true) => (p.surface, p.muted, p.surface),
-        (BTN_PRIMARY | BTN_BIG, false, _) => (p.accent, p.accent_text, p.accent),
-        (BTN_PRIMARY | BTN_BIG, true, _) => (p.selected, p.text, p.accent),
-        (BTN_WARN, false, _) => (p.warn, p.warn_text, p.warn),
-        (BTN_WARN, true, _) => (p.selected, p.text, p.warn),
-        (_, false, _) => (p.bg, p.text, if focused { p.accent } else { p.border }),
-        (_, true, _) => (p.accent, p.accent_text, p.accent),
-    };
-    let radius = if kind == BTN_BIG || kind == BTN_WARN { 14 } else { 8 };
-    let inner = RECT { left: rc.left, top: rc.top, right: rc.right - 1, bottom: rc.bottom - 1 };
-    round_rect(hdc, &inner, outline, Some(bg), radius);
-    if kind == BTN_DROPDOWN {
-        let tr = RECT { left: rc.left + px(12), right: rc.right - px(26), ..rc };
-        text(hdc, &label, &tr, f.normal, fg, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        let ar = RECT { left: rc.right - px(26), ..rc };
-        text(hdc, "▾", &ar, f.normal, p.muted, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    } else {
-        let font = if kind == BTN_BIG || kind == BTN_WARN { f.big } else { f.bold };
-        let tr = RECT { left: rc.left + px(6), right: rc.right - px(6), ..rc };
-        text(hdc, &label, &tr, font, fg, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-    }
-    if focused && (kind == BTN_BIG || kind == BTN_WARN) {
-        let ring = RECT { left: rc.left + px(4), top: rc.top + px(4), right: rc.right - px(5), bottom: rc.bottom - px(5) };
-        round_rect(hdc, &ring, fg, None, 10);
-    }
-}
-
 /// Double-buffered painting: draw into a memory DC, then copy at once
 /// (prevents flicker). In RTL windows the memory DC is mirrored too.
 pub fn paint(hwnd: HWND, draw: impl FnOnce(HDC, &RECT)) {
@@ -562,6 +562,35 @@ pub fn paint(hwnd: HWND, draw: impl FnOnce(HDC, &RECT)) {
         DeleteObject(bmp as _);
         DeleteDC(mem);
         EndPaint(hwnd, &ps);
+    }
+}
+
+/// Double-buffered owner-draw item: `draw` paints into a memory DC the size
+/// of `rc` (given the local rect 0,0,w,h), then one BitBlt copies it to
+/// `hdc`, so a 60 Hz transition never shows half-drawn frames. The memory DC
+/// takes the item DC's layout (mirrored in Hebrew), as `paint` does.
+pub fn buffered_item(hdc: HDC, rc: &RECT, draw: impl FnOnce(HDC, &RECT)) {
+    let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    unsafe {
+        let mem = CreateCompatibleDC(hdc);
+        let bmp = if mem.is_null() { null_mut() } else { CreateCompatibleBitmap(hdc, w, h) };
+        if bmp.is_null() {
+            if !mem.is_null() {
+                DeleteDC(mem);
+            }
+            draw(hdc, rc); // out of GDI resources: draw directly
+            return;
+        }
+        let old = SelectObject(mem, bmp as _);
+        SetLayout(mem, GetLayout(hdc));
+        draw(mem, &RECT { left: 0, top: 0, right: w, bottom: h });
+        BitBlt(hdc, rc.left, rc.top, w, h, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old);
+        DeleteObject(bmp as _);
+        DeleteDC(mem);
     }
 }
 
@@ -587,6 +616,7 @@ pub fn popup_menu(owner: HWND, anchor: HWND, items: &[String], checked: &[usize]
         let (x, align) = if is_rtl() { (rc.right, TPM_RIGHTALIGN | TPM_LAYOUTRTL) } else { (rc.left, TPM_LEFTALIGN) };
         let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | align | TPM_TOPALIGN, x, rc.bottom + 2, 0, owner, null());
         DestroyMenu(menu);
+        kit::sync_hover(anchor);
         (cmd > 0).then(|| cmd as usize - 1)
     }
 }
@@ -629,6 +659,6 @@ pub fn rebuild_all() {
     settings::close();
     main_window::rebuild();
     if let Some(tab) = settings_tab {
-        settings::open_tab(main_window::hwnd(), tab);
+        anim::still_scope(|| settings::open_tab(main_window::hwnd(), tab));
     }
 }

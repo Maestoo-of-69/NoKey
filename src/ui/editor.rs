@@ -1,9 +1,20 @@
 //! Binding editor with four tabs: General, Trigger, Actions, Conditions.
-//! The Actions tab lives in `editor/steps.rs`.
+//! The Trigger tab lives in `editor/trigger.rs`, the Actions tab in
+//! `editor/steps.rs`, recording in `editor/record.rs`, shared measuring and
+//! drawing in `editor/layout.rs`. The tab underline slides after a click.
 
+mod cancel;
+mod layout;
+mod leave;
+mod record;
 mod steps;
+mod trigger;
+mod type_text;
 
-use super::theme::palette;
+pub use leave::try_close;
+pub use record::on_record;
+use record::{add_shortcut, describe, start_recording, stop_recording};
+
 use super::*;
 use crate::app::{self, profile_name};
 use crate::config::{
@@ -18,11 +29,35 @@ use crate::shortcut::Shortcut;
 use crate::win::{get_text, hook, set_text};
 use std::cell::RefCell;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 
 const CLASS: &str = "NoKeyEditor";
-const W: i32 = 540;
-const H: i32 = 620;
+fn view_w() -> i32 {
+    page::width()
+}
+fn view_h() -> i32 {
+    page::height()
+}
+// Layout in 96-DPI units (docs/DESIGN.md): header 52, tabs 36, action bar 56,
+// field frames 36, captions 24 above their field. Rows are frame tops.
+const PAD: i32 = 16;
+fn content_w() -> i32 {
+    view_w() - 2 * PAD
+}
+const TOP: i32 = 108;
+const CAP: i32 = 24;
+const FRAME_H: i32 = 36;
+const Y_NAME: i32 = 132;
+const Y_DESC: i32 = 216;
+const Y_ICON: i32 = 300;
+const ICON_W: i32 = 80;
+const PROFILE_X: i32 = PAD + ICON_W + 16;
+const Y_TOGGLES: i32 = 360; // three 28-tall checkboxes, 32 apart
+const Y_PRIORITY: i32 = 500;
+const PRIORITY_W: i32 = 56;
+const Y_PROCESS: i32 = 204;
+const Y_TITLE: i32 = 328;
+const Y_FULLSCREEN: i32 = 428;
 
 pub(super) const TAB_GENERAL: usize = 0;
 pub(super) const TAB_TRIGGER: usize = 1;
@@ -43,6 +78,8 @@ const ID_REPEAT_INTERVAL: i32 = 327;
 const ID_REPEAT_MAX: i32 = 328;
 const ID_INHERIT: i32 = 329;
 const ID_COOLDOWN: i32 = 330;
+const ID_CANCEL_REC: i32 = 332;
+const ID_CANCEL_CLEAR: i32 = 333;
 const ID_NAME: i32 = 310;
 const ID_DESCRIPTION: i32 = 311;
 const ID_ICON: i32 = 312;
@@ -64,7 +101,8 @@ const MODES: [(RecordMode, &str); 3] = [
 
 pub(super) struct Ed {
     hwnd: HWND,
-    owner: HWND,
+    /// What was loaded (see leave.rs).
+    loaded: String,
     editing: Option<u32>,
     tab: usize,
     tabs: [HWND; 4],
@@ -95,12 +133,22 @@ pub(super) struct Ed {
     repeat_max: HWND,
     t_inherit: HWND,
     cooldown: HWND,
+    // Stop shortcut (see cancel.rs)
+    cancel_shortcut: Option<Shortcut>,
+    cancel_btns: [HWND; 2],
+    /// The running recording is for the stop shortcut.
+    rec_cancel: bool,
+    /// Error or result under the stop row; empty shows the hint.
+    cancel_info: String,
     // Actions (see steps.rs)
     pub(super) steps: steps::Steps,
     // Conditions
     process: HWND,
     title: HWND,
     t_fullscreen: HWND,
+    geo: layout::Geo,
+    /// Shortcut rows the Trigger tab's lower rows were placed for (0 = not yet).
+    placed_rows: usize,
 }
 
 thread_local! {
@@ -119,22 +167,22 @@ pub fn hwnd() -> HWND {
     ed(|e| e.hwnd).unwrap_or(null_mut())
 }
 
-pub fn open(owner: HWND, binding: Option<Binding>) {
-    if let Some(h) = ed(|e| e.hwnd) {
-        unsafe { SetForegroundWindow(h) };
+pub fn open(main: HWND, binding: Option<Binding>) {
+    if ed(|e| e.hwnd).is_some() {
+        main_window::show_main();
         return;
     }
-    let title = t(if binding.is_some() { "editor.title_edit" } else { "editor.title_new" });
-    let hwnd = create_window(CLASS, &title, W, H, owner);
+    if !page::go_home() {
+        return;
+    }
+    main_window::show_main();
+    let hwnd = page::create(CLASS, main);
     if hwnd.is_null() {
         return;
     }
-    ed(|e| e.owner = owner);
     load(binding);
-    unsafe {
-        EnableWindow(owner, 0);
-        ShowWindow(hwnd, SW_SHOW);
-    }
+    leave::remember();
+    page::show_page(hwnd);
     if let Some(name) = ed(|e| e.name) {
         unsafe { SetFocus(name) };
     }
@@ -144,84 +192,81 @@ fn comma() -> bool {
     i18n::language().decimal_comma()
 }
 
-fn on_create(hwnd: HWND) {
-    let b = |id, text: &str, kind, x, y, w, h| {
-        let btn = button(hwnd, id, text, kind);
-        place(btn, x, y, w, h);
-        btn
-    };
-    let e = |id, style, x, y, w| {
-        let ed = edit(hwnd, id, style);
-        place(ed, x, y, w, 20);
-        ed
-    };
-    let tab_w = (W - 48) / 4;
-    let tabs: [HWND; 4] =
-        std::array::from_fn(|i| b(ID_TAB + i as i32, &t(TAB_KEYS[i]), BTN_TAB, 24 + tab_w * i as i32, 8, tab_w, 40));
+/// Places a control (96-DPI units) and returns it.
+fn placed(ctrl: HWND, x: i32, y: i32, w: i32, h: i32) -> HWND {
+    place(ctrl, x, y, w, h);
+    ctrl
+}
 
-    // General
-    let name = e(ID_NAME, 0, 34, 86, W - 68);
+fn field_at(hwnd: HWND, id: i32, style: u32, x: i32, y: i32, w: i32) -> HWND {
+    let e = edit(hwnd, id, style);
+    layout::place_field(e, x, y, w);
+    e
+}
+
+fn create_general(hwnd: HWND) -> [HWND; 8] {
+    let check = |id, key: &str, y| placed(button(hwnd, id, &t(key), BTN_TOGGLE), PAD, y, content_w(), 28);
+    let name = field_at(hwnd, ID_NAME, 0, PAD, Y_NAME, content_w());
     set_cue(name, &t("editor.name_cue"));
-    let description = e(ID_DESCRIPTION, 0, 34, 152, W - 68);
+    let description = field_at(hwnd, ID_DESCRIPTION, 0, PAD, Y_DESC, content_w());
     set_cue(description, &t("editor.description_cue"));
-    let icon = e(ID_ICON, 0, 34, 218, 80);
+    let icon = field_at(hwnd, ID_ICON, 0, PAD, Y_ICON, ICON_W);
     set_cue(icon, "🔔");
-    let profile_btn = b(ID_PROFILE, "", BTN_DROPDOWN, 150, 210, 240, 32);
-    let t_enabled = b(ID_ENABLED, &t("editor.enabled"), BTN_TOGGLE, 24, 262, W - 48, 26);
-    let t_sound = b(ID_SOUND, &t("editor.sound"), BTN_TOGGLE, 24, 292, W - 48, 26);
-    let t_notify = b(ID_NOTIFY, &t("editor.notify"), BTN_TOGGLE, 24, 322, W - 48, 26);
-    let priority = e(ID_PRIORITY, ES_NUMBER as u32, 34, 390, 50);
-    let general = vec![name, description, icon, profile_btn, t_enabled, t_sound, t_notify, priority];
-
-    // Trigger
-    let remove_btns: [HWND; 3] = std::array::from_fn(|i| {
-        b(ID_REMOVE_SC + i as i32, &t("editor.remove"), BTN_SECONDARY, W - 24 - 110, 84 + 32 * i as i32, 110, 28)
-    });
-    let rec_mode_btn = b(ID_REC_MODE, "", BTN_DROPDOWN, 24, 186, 190, 32);
-    let record_btn = b(ID_RECORD, &t("editor.record"), BTN_PRIMARY, 222, 186, 130, 32);
-    let trigger_btn = b(ID_TRIGGER, "", BTN_DROPDOWN, 24, 296, 240, 32);
-    let repeat_interval = e(ID_REPEAT_INTERVAL, 0, 34, 394, 140);
-    let repeat_max = e(ID_REPEAT_MAX, ES_NUMBER as u32, 280, 394, 100);
-    let t_inherit = b(ID_INHERIT, "", BTN_TOGGLE, 24, 456, 330, 26);
-    let cooldown = e(ID_COOLDOWN, 0, 390, 460, 110);
-    let mut trigger = vec![rec_mode_btn, record_btn, trigger_btn, repeat_interval, repeat_max, t_inherit, cooldown];
-    trigger.extend(remove_btns);
-
-    // Actions
-    let (steps, actions_group) = steps::create(hwnd);
-
-    // Conditions
-    let process = e(ID_PROCESS, 0, 34, 140, W - 68);
-    set_cue(process, "chrome.exe");
-    let title = e(ID_TITLE, 0, 34, 226, W - 68);
-    set_cue(title, &t("editor.title_cue"));
-    let t_fullscreen = b(ID_FULLSCREEN, &t("editor.skip_fullscreen"), BTN_TOGGLE, 24, 290, W - 48, 26);
-    let conditions = vec![process, title, t_fullscreen];
-
-    b(ID_SAVE, &t("common.save"), BTN_PRIMARY, 24, 568, 140, 36);
-    b(ID_CANCEL, &t("common.cancel"), BTN_SECONDARY, 172, 568, 120, 36);
-
+    let profile = placed(button(hwnd, ID_PROFILE, "", BTN_DROPDOWN), PROFILE_X, Y_ICON + 2, 240, 32);
+    let enabled = check(ID_ENABLED, "editor.enabled", Y_TOGGLES);
+    let sound = check(ID_SOUND, "editor.sound", Y_TOGGLES + 32);
+    let notify = check(ID_NOTIFY, "editor.notify", Y_TOGGLES + 64);
+    let priority = field_at(hwnd, ID_PRIORITY, ES_NUMBER as u32, PAD, Y_PRIORITY, PRIORITY_W);
     add_tooltip(hwnd, priority, &t("tip.priority"));
-    add_tooltip(hwnd, trigger_btn, &t("tip.trigger"));
-    add_tooltip(hwnd, repeat_interval, &t("tip.repeat_interval"));
-    add_tooltip(hwnd, repeat_max, &t("tip.repeat_max"));
-    add_tooltip(hwnd, t_inherit, &t("tip.cooldown"));
-    add_tooltip(hwnd, cooldown, &t("tip.cooldown"));
+    add_tooltip(hwnd, icon, &t("tip.icon"));
+    [name, description, icon, profile, enabled, sound, notify, priority]
+}
+
+fn create_conditions(hwnd: HWND) -> [HWND; 3] {
+    let process = field_at(hwnd, ID_PROCESS, 0, PAD, Y_PROCESS, content_w());
+    set_cue(process, "chrome.exe");
+    let title = field_at(hwnd, ID_TITLE, 0, PAD, Y_TITLE, content_w());
+    set_cue(title, &t("editor.title_cue"));
+    let skip = button(hwnd, ID_FULLSCREEN, &t("editor.skip_fullscreen"), BTN_TOGGLE);
+    place(skip, PAD, Y_FULLSCREEN, content_w(), 28);
     add_tooltip(hwnd, process, &t("tip.process"));
     add_tooltip(hwnd, title, &t("tip.window_title"));
-    add_tooltip(hwnd, t_fullscreen, &t("tip.fullscreen"));
-    add_tooltip(hwnd, icon, &t("tip.icon"));
+    add_tooltip(hwnd, skip, &t("tip.fullscreen"));
+    [process, title, skip]
+}
 
+fn on_create(hwnd: HWND) {
+    let g = layout::Geo::measure(hwnd);
+    page::home_button(hwnd); // first: it is also first in the Tab order
+    let tabs: [HWND; 4] = std::array::from_fn(|i| {
+        let (x, w) = g.tabs[i];
+        // 34 tall: the 2px strip below is the parent-drawn underline.
+        placed(button(hwnd, ID_TAB + i as i32, &t(TAB_KEYS[i]), BTN_TAB), x, 52, w, 34)
+    });
+    let general = create_general(hwnd);
+    let (trigger, remove_btns) = trigger::create(hwnd, &g);
+    let cancel_btns = cancel::create(hwnd);
+    let (steps, actions_group) = steps::create(hwnd);
+    let conditions = create_conditions(hwnd);
+    // Action bar: Cancel (ghost) then Save (primary), right-aligned.
+    placed(button(hwnd, ID_CANCEL, &t("common.cancel"), BTN_SECONDARY), g.cancel.0, view_h() - 44, g.cancel.1, 32);
+    placed(button(hwnd, ID_SAVE, &t("common.save"), BTN_PRIMARY), g.save.0, view_h() - 44, g.save.1, 32);
+    let [name, description, icon, profile_btn, t_enabled, t_sound, t_notify, priority] = general;
+    let [rec_mode_btn, record_btn, trigger_btn, repeat_interval, repeat_max, t_inherit, cooldown] = trigger;
+    let [process, title, t_fullscreen] = conditions;
     let mut edits = vec![name, description, icon, priority, repeat_interval, repeat_max, cooldown, process, title];
     edits.extend(steps.edits());
+    let mut trigger_group = trigger.to_vec();
+    trigger_group.extend(remove_btns);
+    trigger_group.extend(cancel_btns);
     ED.with(|cell| {
         *cell.borrow_mut() = Some(Ed {
             hwnd,
-            owner: null_mut(),
+            loaded: String::new(),
             editing: None,
             tab: TAB_GENERAL,
             tabs,
-            groups: [general, trigger, actions_group, conditions],
+            groups: [general.to_vec(), trigger_group, actions_group, conditions.to_vec()],
             edits,
             name,
             description,
@@ -246,10 +291,16 @@ fn on_create(hwnd: HWND) {
             repeat_max,
             t_inherit,
             cooldown,
+            cancel_shortcut: None,
+            cancel_btns,
+            rec_cancel: false,
+            cancel_info: String::new(),
             steps,
             process,
             title,
             t_fullscreen,
+            geo: g,
+            placed_rows: 0,
         })
     });
 }
@@ -265,6 +316,8 @@ fn load(binding: Option<Binding>) {
         e.editing = binding.as_ref().map(|x| x.id);
         e.profile = b.profile;
         e.shortcuts = b.shortcuts.clone();
+        e.cancel_shortcut = b.cancel_shortcut.clone();
+        e.cancel_info = String::new();
         e.trigger = b.trigger.mode;
         e.mode = match b.shortcuts.first() {
             Some(Shortcut::Combo { .. }) => RecordMode::Combo,
@@ -293,6 +346,7 @@ fn load(binding: Option<Binding>) {
     for (h, v) in texts.iter().zip(values) {
         set_text(*h, &v);
     }
+    ed(|e| e.placed_rows = 0); // the inherit label changed: re-place the cooldown row
     let flags = [b.enabled, b.sound, b.notify, b.cooldown_ms.is_none(), b.conditions.skip_fullscreen];
     for (h, on) in toggles.iter().zip(flags) {
         set_checked(*h, on);
@@ -302,6 +356,30 @@ fn load(binding: Option<Binding>) {
         let info = describe(sc, b.id, b.profile);
         ed(|e| e.info = info);
     }
+    layout();
+}
+
+/// The window changed size: right-aligned controls move, fields stretch, the
+/// action bar follows the bottom edge.
+pub fn resize(by: page::Resize) {
+    let Some((hwnd, mut right, mut wide)) = ed(|e| {
+        let mut right = vec![e.rec_mode_btn, e.record_btn];
+        right.extend(e.remove_btns);
+        let wide = vec![e.name, e.description, e.t_enabled, e.t_sound, e.t_notify, e.process, e.title, e.t_fullscreen];
+        (e.hwnd, right, wide)
+    }) else {
+        return;
+    };
+    let bar = [ID_CANCEL, ID_SAVE].map(|id| unsafe { GetDlgItem(hwnd, id) });
+    right.extend(bar);
+    wide.extend(ed(|e| [e.steps.list(), e.steps.stop_toggle()]).into_iter().flatten());
+    page::anchor(hwnd, by, &right, &wide, &bar);
+    // Measured positions and the rows placed from them follow the new width.
+    let geo = layout::Geo::measure(hwnd);
+    ed(|e| {
+        e.geo = geo;
+        e.placed_rows = 0;
+    });
     layout();
 }
 
@@ -315,15 +393,17 @@ pub(super) fn layout() {
             e.groups.clone(),
             e.shortcuts.len(),
             e.remove_btns,
-            (e.rec_mode_btn, e.mode, e.record_btn, e.recording),
+            (e.rec_mode_btn, e.mode, e.record_btn, e.recording && !e.rec_cancel),
+            (e.cancel_btns, e.recording && e.rec_cancel, e.cancel_shortcut.is_some()),
             (e.trigger_btn, e.trigger, e.profile_btn, e.profile),
             (e.t_inherit, e.cooldown, [e.repeat_interval, e.repeat_max]),
         )
     }) else {
         return;
     };
-    let (hwnd, tab, tabs, groups, n_sc, removes, rec, trig, cd) = s;
+    let (hwnd, tab, tabs, groups, n_sc, removes, rec, stop, trig, cd) = s;
     let (rec_mode_btn, mode, record_btn, recording) = rec;
+    let ([stop_record, stop_clear], stop_recording_now, has_stop) = stop;
     let (trigger_btn, trigger, profile_btn, profile) = trig;
     let (inherit, cooldown, rep) = cd;
     for (i, group) in groups.iter().enumerate() {
@@ -333,6 +413,7 @@ pub(super) fn layout() {
         }
     }
     if tab == TAB_TRIGGER {
+        trigger::place_rows(n_sc);
         for (i, &b) in removes.iter().enumerate() {
             show(b, i < n_sc);
         }
@@ -346,7 +427,14 @@ pub(super) fn layout() {
     let mode_key = MODES.iter().find(|(m, _)| *m == mode).map(|(_, k)| *k).unwrap_or("editor.mode_standard");
     set_text(rec_mode_btn, &t(mode_key));
     set_text(record_btn, &t(if recording { "editor.stop" } else { "editor.record" }));
+    // One primary per window (Save): Record is ghost, warn-coloured while recording.
+    set_kind(record_btn, if recording { BTN_WARN } else { BTN_SECONDARY });
+    kit::set_pulsing(record_btn, recording);
     enable(record_btn, recording || n_sc < MAX_SHORTCUTS);
+    set_text(stop_record, &t(if stop_recording_now { "editor.stop" } else { "editor.record" }));
+    set_kind(stop_record, if stop_recording_now { BTN_WARN } else { BTN_SECONDARY });
+    kit::set_pulsing(stop_record, stop_recording_now);
+    enable(stop_clear, has_stop || stop_recording_now);
     set_text(trigger_btn, &t(trigger.key()));
     let pname = app::with(|a| profile_name(&a.config, profile));
     set_text(profile_btn, &pname);
@@ -354,201 +442,40 @@ pub(super) fn layout() {
     invalidate(hwnd);
 }
 
-fn trigger_hint(mode: TriggerMode) -> String {
-    let (double_tap, long_press) = app::with(|a| (a.config.double_tap_ms, a.config.long_press_ms));
-    match mode {
-        TriggerMode::Press => t("editor.hint_press"),
-        TriggerMode::Release => t("editor.hint_release"),
-        TriggerMode::DoubleTap => tf("editor.hint_double_tap", &[("ms", &double_tap.to_string())]),
-        TriggerMode::LongPress => tf("editor.hint_long_press", &[("ms", &long_press.to_string())]),
-        TriggerMode::Repeat => t("editor.hint_repeat"),
-        TriggerMode::Toggle => t("editor.hint_toggle"),
-    }
+fn paint_general(hdc: HDC) {
+    caption(hdc, &t("editor.name"), PAD, Y_NAME - CAP, content_w());
+    caption(hdc, &t("editor.description"), PAD, Y_DESC - CAP, content_w());
+    caption(hdc, &t("editor.icon"), PAD, Y_ICON - CAP, ICON_W);
+    caption(hdc, &t("editor.profile"), PROFILE_X, Y_ICON - CAP, 240);
+    caption(hdc, &t("editor.priority"), PAD, Y_PRIORITY - CAP, content_w());
+    let x = PAD + PRIORITY_W + 12;
+    layout::muted_centered(hdc, &t("editor.priority_hint"), &r(x, Y_PRIORITY - 6, view_w() - PAD - x, 48));
 }
 
-fn kind_key(sc: &Shortcut) -> &'static str {
-    match sc {
-        Shortcut::Standard { .. } => "editor.mode_standard",
-        Shortcut::Combo { .. } => "editor.mode_combo",
-        Shortcut::Sequence { .. } => "editor.mode_sequence",
-    }
-}
-
-fn paint_trigger(hdc: HDC, shortcuts: &[Shortcut], live: &str, info: &str, recording: bool, trigger: TriggerMode) {
-    let p = palette();
-    let f = fonts();
-    caption(hdc, &t("editor.shortcuts"), 24, 60, 300);
-    if shortcuts.is_empty() {
-        text(hdc, &t("editor.no_shortcuts"), &r(24, 84, W - 160, 28), f.normal, p.muted, DT_SINGLELINE | DT_VCENTER);
-    }
-    for (i, sc) in shortcuts.iter().enumerate() {
-        let row = r(24, 84 + 32 * i as i32, W - 160, 28);
-        round_rect(hdc, &row, p.border, Some(p.surface), 8);
-        let inner = RECT { left: row.left + px(10), ..row };
-        let label = format!("{}  ·  {}", sc.label(), t(kind_key(sc)));
-        text(hdc, &label, &inner, f.bold, p.text, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-    }
-    let shown = match (recording, live.is_empty()) {
-        (true, true) => t("editor.press_keys"),
-        (true, false) => live.to_string(),
-        _ => String::new(),
-    };
-    text(hdc, &shown, &r(24, 224, W - 48, 22), f.bold, p.text, DT_SINGLELINE | DT_END_ELLIPSIS);
-    text(hdc, info, &r(24, 246, W - 48, 30), f.small, p.muted, DT_WORDBREAK | DT_END_ELLIPSIS);
-    caption(hdc, &t("editor.trigger"), 24, 276, 300);
-    text(hdc, &trigger_hint(trigger), &r(24, 334, W - 48, 34), f.small, p.muted, DT_WORDBREAK | DT_END_ELLIPSIS);
-    if trigger.repeats() {
-        caption(hdc, &t("editor.repeat_interval"), 24, 370, 240);
-        caption(hdc, &t("editor.repeat_max"), 270, 370, 220);
-    }
-    caption(hdc, &t("editor.cooldown"), 24, 434, 300);
-    text(hdc, &t("editor.cooldown_hint"), &r(24, 496, W - 48, 34), f.small, p.muted, DT_WORDBREAK);
+fn paint_conditions(hdc: HDC) {
+    layout::muted(hdc, &t("editor.conditions_hint"), &r(PAD, TOP, content_w(), 48));
+    caption(hdc, &t("editor.process"), PAD, Y_PROCESS - CAP, content_w());
+    layout::muted(hdc, &t("editor.process_hint"), &r(PAD, Y_PROCESS + FRAME_H + 4, content_w(), 32));
+    caption(hdc, &t("editor.window_title"), PAD, Y_TITLE - CAP, content_w());
+    layout::muted(hdc, &t("editor.window_title_hint"), &r(PAD, Y_TITLE + FRAME_H + 4, content_w(), 32));
 }
 
 fn on_paint(hwnd: HWND) {
-    let Some((tab, edits, shortcuts, live, info, recording, trigger)) =
-        ed(|e| (e.tab, e.edits.clone(), e.shortcuts.clone(), e.live.clone(), e.info.clone(), e.recording, e.trigger))
-    else {
+    let Some((tab, tabs, edits, editing)) = ed(|e| (e.tab, e.tabs, e.edits.clone(), e.editing.is_some())) else {
         return;
     };
+    let title = t(if editing { "editor.title_edit" } else { "editor.title_new" });
     paint(hwnd, |hdc, _| {
-        let p = palette();
-        let f = fonts();
-        header_band(hdc, W, 52);
+        layout::paint_chrome(hdc, hwnd, &title);
+        kit::tab_underline(hdc, hwnd, tabs[tab]);
         edit_frames(hwnd, hdc, &edits);
         match tab {
-            TAB_GENERAL => {
-                caption(hdc, &t("editor.name"), 24, 60, 300);
-                caption(hdc, &t("editor.description"), 24, 126, 300);
-                caption(hdc, &t("editor.icon"), 24, 192, 110);
-                caption(hdc, &t("editor.profile"), 150, 192, 240);
-                caption(hdc, &t("editor.priority"), 24, 364, 300);
-                text(hdc, &t("editor.priority_hint"), &r(104, 386, W - 128, 30), f.small, p.muted, DT_WORDBREAK);
-            }
-            TAB_TRIGGER => paint_trigger(hdc, &shortcuts, &live, &info, recording, trigger),
+            TAB_GENERAL => paint_general(hdc),
+            TAB_TRIGGER => trigger::paint(hdc),
             TAB_ACTIONS => steps::paint(hdc),
-            _ => {
-                text(hdc, &t("editor.conditions_hint"), &r(24, 60, W - 48, 40), f.small, p.muted, DT_WORDBREAK);
-                caption(hdc, &t("editor.process"), 24, 112, 300);
-                let hint = r(24, 172, W - 48, 18);
-                text(hdc, &t("editor.process_hint"), &hint, f.small, p.muted, DT_SINGLELINE | DT_END_ELLIPSIS);
-                caption(hdc, &t("editor.window_title"), 24, 198, 300);
-                let hint = r(24, 258, W - 48, 18);
-                text(hdc, &t("editor.window_title_hint"), &hint, f.small, p.muted, DT_SINGLELINE | DT_END_ELLIPSIS);
-            }
+            _ => paint_conditions(hdc),
         }
     });
-}
-
-// ---------- recording ----------
-
-fn start_recording() {
-    let Some(mode) = ed(|e| e.mode) else { return };
-    match hook::start_recording(Recorder::new(mode)) {
-        Ok(()) => {
-            let prompt = t(match mode {
-                RecordMode::Standard => "editor.prompt_standard",
-                RecordMode::Combo => "editor.prompt_combo",
-                RecordMode::Sequence => "editor.prompt_sequence",
-            });
-            let hwnd = ed(|e| {
-                e.recording = true;
-                e.live = String::new();
-                e.info = prompt;
-                e.hwnd
-            });
-            if let Some(h) = hwnd {
-                unsafe {
-                    SetFocus(h); // outside the borrow: SetFocus sends EN_KILLFOCUS synchronously
-                    SetTimer(h, TIMER_RECORD_LIMIT, RECORD_LIMIT_MS, None);
-                }
-            }
-        }
-        Err(err) => {
-            ed(|e| e.info = err);
-        }
-    }
-    layout();
-}
-
-fn stop_recording() -> Option<RecordUpdate> {
-    let (was, hwnd) = ed(|e| (std::mem::replace(&mut e.recording, false), e.hwnd)).unwrap_or((false, null_mut()));
-    if !was {
-        return None;
-    }
-    unsafe { KillTimer(hwnd, TIMER_RECORD_LIMIT) };
-    let result = hook::stop_recording();
-    layout();
-    result
-}
-
-/// Explains how the shortcut behaves, or what it conflicts with.
-fn describe(sc: &Shortcut, self_id: u32, profile: u32) -> String {
-    let conflicts = app::with(|a| a.config.conflicts_with(sc, Some(self_id), profile));
-    if !conflicts.is_empty() {
-        tf("editor.conflict", &[("details", &conflicts.join("; "))])
-    } else if sc.needs_hook() {
-        t("editor.uses_hook")
-    } else {
-        t("editor.works_everywhere")
-    }
-}
-
-fn add_shortcut(sc: Shortcut) {
-    let Some((id, profile, existing)) = ed(|e| (e.editing.unwrap_or(0), e.profile, e.shortcuts.clone())) else { return };
-    if let Err(err) = config::check_shortcut(&sc) {
-        ed(|e| e.info = err);
-        layout();
-        return;
-    }
-    if existing.contains(&sc) {
-        ed(|e| e.info = t("editor.already_added"));
-        layout();
-        return;
-    }
-    let info = describe(&sc, id, profile);
-    ed(|e| {
-        if e.shortcuts.len() < MAX_SHORTCUTS {
-            e.shortcuts.push(sc);
-        }
-        e.info = info;
-    });
-    layout();
-}
-
-pub fn on_record(update: RecordUpdate) {
-    let Some((mode, recording)) = ed(|e| (e.mode, e.recording)) else {
-        hook::stop_recording();
-        return;
-    };
-    if !recording {
-        return; // a late update from a recording that already ended
-    }
-    match update {
-        RecordUpdate::Progress(s) => {
-            ed(|e| e.live = s);
-            layout();
-        }
-        RecordUpdate::Done(sc) => {
-            stop_recording();
-            add_shortcut(sc);
-        }
-        RecordUpdate::Cancelled => {
-            stop_recording();
-            ed(|e| e.info = t("editor.record_cancelled"));
-            layout();
-        }
-        RecordUpdate::Rejected(msg) => {
-            if mode == RecordMode::Sequence {
-                stop_recording();
-            }
-            ed(|e| {
-                e.info = msg;
-                e.live = String::new();
-            });
-            layout();
-        }
-    }
 }
 
 // ---------- Discord lookups (forwarded to the Actions tab) ----------
@@ -582,7 +509,7 @@ fn build() -> Result<Binding, (String, usize)> {
     steps::commit();
     let Some(e) = ed(|e| {
         (
-            (e.editing, e.profile, e.shortcuts.clone(), e.trigger),
+            (e.editing, e.profile, e.shortcuts.clone(), e.cancel_shortcut.clone(), e.trigger),
             [e.name, e.description, e.icon, e.priority, e.repeat_interval, e.repeat_max, e.cooldown, e.process, e.title],
             [e.t_enabled, e.t_sound, e.t_notify, e.t_inherit, e.t_fullscreen],
             e.steps.actions.clone(),
@@ -590,7 +517,7 @@ fn build() -> Result<Binding, (String, usize)> {
     }) else {
         return Err((String::new(), TAB_GENERAL));
     };
-    let ((editing, profile, shortcuts, mode), edits, toggles, actions) = e;
+    let ((editing, profile, shortcuts, cancel_shortcut, mode), edits, toggles, actions) = e;
     let [name, description, icon, priority, rep_int, rep_max, cooldown, process, title] = edits.map(get_text);
     let [enabled, sound, notify, inherit, fullscreen] = toggles.map(is_checked);
     let (step_delay_ms, stop_on_failure) = steps::read_options().map_err(|m| (m, TAB_ACTIONS))?;
@@ -634,11 +561,13 @@ fn build() -> Result<Binding, (String, usize)> {
             window_title: title.trim().to_string(),
             skip_fullscreen: fullscreen,
         },
+        cancel_shortcut,
     };
     if let Err((key, step)) = binding.validate() {
         let tab = match key {
             "err.name" => TAB_GENERAL,
-            "err.repeat_discord" | "err.too_many_shortcuts" => TAB_TRIGGER,
+            "err.repeat_discord" | "err.repeat_typing" | "err.too_many_shortcuts" => TAB_TRIGGER,
+            "err.cancel_standard" | "err.cancel_invalid" | "err.cancel_reserved" | "err.cancel_same" => TAB_TRIGGER,
             _ => TAB_ACTIONS,
         };
         let msg = match step {
@@ -689,12 +618,10 @@ fn save() {
 
 pub fn close() {
     stop_recording();
-    let Some((hwnd, owner)) = ed(|e| (e.hwnd, e.owner)) else { return };
+    let Some(hwnd) = ed(|e| e.hwnd) else { return };
     ED.with(|e| *e.borrow_mut() = None);
-    unsafe {
-        EnableWindow(owner, 1); // re-enable before destroying so focus returns to it
-        DestroyWindow(hwnd);
-    }
+    unsafe { DestroyWindow(hwnd) };
+    page::closed();
 }
 
 /// Lets Tab/Shift+Tab move between controls.
@@ -713,6 +640,16 @@ pub(super) fn set_tab(tab: usize) {
     layout();
 }
 
+/// A tab button was clicked: the underline slides when the mouse did it.
+fn click_tab(hwnd: HWND, new: usize) {
+    if anim::by_pointer()
+        && let Some((old, tabs)) = ed(|e| (e.tab, e.tabs))
+    {
+        kit::slide_tab(hwnd, tabs[old], tabs[new]);
+    }
+    set_tab(new);
+}
+
 fn menu_choice<T: Copy + PartialEq>(hwnd: HWND, anchor: HWND, options: &[(T, String)], current: T) -> Option<T> {
     let items: Vec<String> = options.iter().map(|(_, s)| s.clone()).collect();
     let checked: Vec<usize> = options.iter().position(|(v, _)| *v == current).into_iter().collect();
@@ -722,7 +659,7 @@ fn menu_choice<T: Copy + PartialEq>(hwnd: HWND, anchor: HWND, options: &[(T, Str
 fn on_command(id: i32, code: u32) {
     let Some(hwnd) = ed(|e| e.hwnd) else { return };
     match id {
-        _ if (ID_TAB..ID_TAB + 4).contains(&id) => set_tab((id - ID_TAB) as usize),
+        _ if (ID_TAB..ID_TAB + 4).contains(&id) => click_tab(hwnd, (id - ID_TAB) as usize),
         ID_PROFILE => {
             let Some((btn, current)) = ed(|e| (e.profile_btn, e.profile)) else { return };
             let mut options = vec![(ALL_PROFILES, t("profile.all"))];
@@ -760,7 +697,7 @@ fn on_command(id: i32, code: u32) {
             if let Some(m) = menu_choice(hwnd, btn, &options, mode) {
                 ed(|e| e.mode = m);
                 // read after the menu closes: recording may have ended meanwhile
-                if ed(|e| e.recording).unwrap_or(false) {
+                if ed(|e| e.recording && !e.rec_cancel).unwrap_or(false) {
                     stop_recording();
                     start_recording();
                 }
@@ -768,7 +705,7 @@ fn on_command(id: i32, code: u32) {
             }
         }
         ID_RECORD => {
-            if ed(|e| e.recording).unwrap_or(false) {
+            if ed(|e| e.recording && !e.rec_cancel).unwrap_or(false) {
                 match stop_recording() {
                     Some(RecordUpdate::Done(sc)) => add_shortcut(sc),
                     Some(RecordUpdate::Rejected(m)) => {
@@ -780,9 +717,11 @@ fn on_command(id: i32, code: u32) {
                 }
                 layout();
             } else {
+                stop_recording(); // the stop shortcut may be recording
                 start_recording();
             }
         }
+        ID_CANCEL_REC | ID_CANCEL_CLEAR => cancel::on_command(id),
         ID_TRIGGER => {
             let Some((btn, mode)) = ed(|e| (e.trigger_btn, e.trigger)) else { return };
             let options: Vec<(TriggerMode, String)> = TriggerMode::ALL.iter().map(|m| (*m, t(m.key()))).collect();
@@ -793,6 +732,9 @@ fn on_command(id: i32, code: u32) {
         }
         ID_SAVE => save(),
         ID_CANCEL | IDCANCEL_KEY => close(),
+        page::ID_HOME => {
+            page::go_home();
+        }
         _ if code == EN_SETFOCUS || code == EN_KILLFOCUS || code == EN_CHANGE => {
             if !steps::on_edit_change(id, code) {
                 invalidate(hwnd);
@@ -803,6 +745,12 @@ fn on_command(id: i32, code: u32) {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == WM_CTLCOLORSTATIC {
+        let edits = ed(|e| e.edits.clone()).unwrap_or_default();
+        if let Some(r) = layout::disabled_edit_color(wparam, lparam, &edits) {
+            return r;
+        }
+    }
     if let Some(r) = ctl_color(msg, wparam) {
         return r;
     }
@@ -818,7 +766,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_ERASEBKGND => 1,
         WM_MEASUREITEM => {
             let mis = unsafe { &mut *(lparam as *mut MEASUREITEMSTRUCT) };
-            mis.itemHeight = px(30) as u32;
+            mis.itemHeight = px(steps::ROW_H) as u32;
             1
         }
         WM_DRAWITEM => {
@@ -835,9 +783,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             on_command(id, code);
             0
         }
+        WM_TIMER if anim::on_timer(hwnd, wparam) => {
+            page::on_frame(hwnd);
+            0
+        }
         WM_TIMER if wparam == TIMER_RECORD_LIMIT => {
             if stop_recording().is_some() {
-                ed(|e| e.info = t("editor.record_timeout"));
+                ed(|e| {
+                    let msg = t("editor.record_timeout");
+                    if e.rec_cancel { e.cancel_info = msg } else { e.info = msg }
+                });
                 layout();
             }
             0
@@ -845,6 +800,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_CLOSE => {
             close();
             0
+        }
+        WM_NCDESTROY => {
+            anim::forget(hwnd);
+            def(hwnd, msg, wparam, lparam)
         }
         _ => def(hwnd, msg, wparam, lparam),
     }
