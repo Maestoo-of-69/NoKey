@@ -7,7 +7,9 @@
 
 use super::theme::palette;
 use super::*;
-use crate::app::{self, is_builtin_profile, Conn, TaskResult};
+use crate::app::{self, is_builtin_profile, Conn};
+#[cfg(not(feature = "store"))]
+use crate::app::TaskResult;
 use crate::config::{
     timing, Language, Theme, COMBO_WINDOW_RANGE, COOLDOWN_RANGE_MS, DOUBLE_TAP_RANGE, LONG_PRESS_RANGE,
     SEQUENCE_TIMEOUT_RANGE,
@@ -15,7 +17,9 @@ use crate::config::{
 use crate::engine::recorder::{RecordMode, RecordUpdate, Recorder};
 use crate::i18n::{self, t, tf};
 use crate::security::dpapi::mask;
-use crate::update::{self, ReleaseInfo, CURRENT_VERSION};
+use crate::update::CURRENT_VERSION;
+#[cfg(not(feature = "store"))]
+use crate::update::{self, ReleaseInfo};
 use crate::win::{get_text, hook, set_text};
 use std::cell::RefCell;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -71,7 +75,10 @@ const TAB_KEYS: [&str; 4] = ["settings.tab_general", "settings.tab_discord", "se
 const ID_TAB: i32 = 400; // 400..404
 const ID_THEME: i32 = 410;
 const ID_LANGUAGE: i32 = 411;
-const ID_TOGGLE: i32 = 412; // 412..416
+const ID_TOGGLE: i32 = 412; // 412..415
+/// Store build: opens Windows Settings > Apps > Startup (replaces the first switch).
+#[cfg(feature = "store")]
+const ID_STARTUP_APPS: i32 = 416;
 const ID_NUM: i32 = 420; // 420..425
 const ID_TOKEN: i32 = 430;
 const ID_CONNECT: i32 = 431;
@@ -85,7 +92,9 @@ const ID_P_DELETE: i32 = 445;
 const ID_P_ACTIVATE: i32 = 446;
 const ID_SWITCH_RECORD: i32 = 447;
 const ID_SWITCH_CLEAR: i32 = 448;
+#[cfg(not(feature = "store"))]
 const ID_REPO: i32 = 450;
+#[cfg(not(feature = "store"))]
 const ID_CHECK: i32 = 451;
 const ID_SAVE: i32 = 460;
 const ID_CLOSE: i32 = 461;
@@ -122,8 +131,11 @@ struct Se {
     shortcut_w: i32,
     recording: bool,
     switch_info: String,
+    #[cfg(not(feature = "store"))]
     repo: HWND,
+    #[cfg(not(feature = "store"))]
     btn_check: HWND,
+    #[cfg(not(feature = "store"))]
     update_status: String,
 }
 
@@ -180,7 +192,7 @@ fn comma() -> bool {
 
 fn load() {
     let cfg = app::with(|a| a.config.clone());
-    let Some((toggles, nums, repo)) = se(|s| (s.toggles, s.nums, s.repo)) else { return };
+    let Some((toggles, nums)) = se(|s| (s.toggles, s.nums)) else { return };
     let flags = [cfg.start_with_windows, cfg.minimize_to_tray, cfg.launch_minimized, cfg.notifications];
     for (b, on) in toggles.iter().zip(flags) {
         set_checked(*b, on);
@@ -195,7 +207,10 @@ fn load() {
     for (e, v) in nums.iter().zip(values) {
         set_text(*e, &v);
     }
-    set_text(repo, &cfg.update_repo);
+    #[cfg(not(feature = "store"))]
+    if let Some(repo) = se(|s| s.repo) {
+        set_text(repo, &cfg.update_repo);
+    }
     refresh();
 }
 
@@ -220,7 +235,7 @@ pub fn refresh() {
     let (has_token, theme, language, profiles) =
         app::with(|a| (a.token.is_some(), a.config.theme, a.config.language, a.config.profiles.clone()));
     enable(disconnect, has_token);
-    set_text(theme_btn, &t(theme.key()));
+    set_text(theme_btn, &t(theme.effective().key()));
     set_text(language_btn, language.native_name());
     let selected = selected_profile();
     unsafe {
@@ -368,6 +383,7 @@ pub fn on_record(update: RecordUpdate) {
 
 // ---------- updates ----------
 
+#[cfg(not(feature = "store"))]
 fn check_updates() {
     let Some((hwnd, repo_edit, btn)) = se(|s| (s.hwnd, s.repo, s.btn_check)) else { return };
     let repo = get_text(repo_edit).trim().to_string();
@@ -380,6 +396,7 @@ fn check_updates() {
     app::spawn_task(move || TaskResult::UpdateChecked(update::check(&repo)));
 }
 
+#[cfg(not(feature = "store"))]
 fn set_status(text: &str) {
     if let Some(h) = se(|s| {
         s.update_status = text.to_string();
@@ -389,6 +406,7 @@ fn set_status(text: &str) {
     }
 }
 
+#[cfg(not(feature = "store"))]
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -396,6 +414,7 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{}…", s.chars().take(max).collect::<String>())
 }
 
+#[cfg(not(feature = "store"))]
 pub fn on_update_checked(result: Result<Option<ReleaseInfo>, String>) {
     let Some((hwnd, btn)) = se(|s| (s.hwnd, s.btn_check)) else { return };
     enable(btn, true);
@@ -418,6 +437,7 @@ pub fn on_update_checked(result: Result<Option<ReleaseInfo>, String>) {
     }
 }
 
+#[cfg(not(feature = "store"))]
 pub fn on_update_downloaded(result: Result<update::Downloaded, String>) {
     let Some((hwnd, btn)) = se(|s| (s.hwnd, s.btn_check)) else { return };
     enable(btn, true);
@@ -437,7 +457,7 @@ pub fn on_update_downloaded(result: Result<update::Downloaded, String>) {
 // ---------- save ----------
 
 fn save() {
-    let Some((hwnd, toggles, nums, repo_edit)) = se(|s| (s.hwnd, s.toggles, s.nums, s.repo)) else { return };
+    let Some((hwnd, toggles, nums)) = se(|s| (s.hwnd, s.toggles, s.nums)) else { return };
     let label = |i: usize| t(NUMS[i].0);
     let ms = |i: usize, range: (u32, u32)| {
         timing::parse_ms_in(&get_text(nums[i]), range)
@@ -465,18 +485,25 @@ fn save() {
             return;
         }
     };
-    let repo = get_text(repo_edit).trim().to_string();
-    if !repo.is_empty() && !update::is_valid_repo(&repo) {
-        alert(hwnd, &t("err.repo"));
-        return;
-    }
     let mut next = app::with(|a| a.config.clone());
-    next.start_with_windows = is_checked(toggles[0]);
+    #[cfg(not(feature = "store"))]
+    {
+        let repo = se(|s| get_text(s.repo)).unwrap_or_default().trim().to_string();
+        if !repo.is_empty() && !update::is_valid_repo(&repo) {
+            alert(hwnd, &t("err.repo"));
+            return;
+        }
+        next.update_repo = repo;
+    }
+    // Store build: autostart lives in Windows Settings, keep the stored value.
+    #[cfg(not(feature = "store"))]
+    {
+        next.start_with_windows = is_checked(toggles[0]);
+    }
     next.minimize_to_tray = is_checked(toggles[1]);
     next.launch_minimized = is_checked(toggles[2]);
     next.notifications = is_checked(toggles[3]);
     [next.cooldown_ms, next.combo_window_ms, next.sequence_timeout_ms, next.double_tap_ms, next.long_press_ms] = values;
-    next.update_repo = repo;
     match app::save_settings(next) {
         Ok(()) => close(),
         Err(e) => alert(hwnd, &e),
@@ -498,7 +525,11 @@ pub fn resize(by: page::Resize) {
     let Some((hwnd, toggles, columns, wide)) = se(|s| {
         s.shortcut_w += view_w() - by.old_width;
         let columns = (s.theme_btn, s.language_btn, s.nums);
-        (s.hwnd, s.toggles, columns, [s.token, s.profiles, s.profile_name, s.repo])
+        #[cfg(not(feature = "store"))]
+        let wide = vec![s.token, s.profiles, s.profile_name, s.repo];
+        #[cfg(feature = "store")]
+        let wide = vec![s.token, s.profiles, s.profile_name];
+        (s.hwnd, s.toggles, columns, wide)
     }) else {
         return;
     };
@@ -506,11 +537,12 @@ pub fn resize(by: page::Resize) {
     let bar = [item(ID_CLOSE), item(ID_SAVE)];
     let mut right = toggles.to_vec();
     right.extend(
-        [ID_CONNECT, ID_DISCONNECT, ID_P_ADD, ID_P_RENAME, ID_P_DUPLICATE, ID_P_DELETE, ID_SWITCH_RECORD]
+        [ID_CONNECT, ID_DISCONNECT, ID_P_ADD, ID_P_RENAME, ID_P_DUPLICATE, ID_P_DELETE, ID_SWITCH_RECORD, ID_SWITCH_CLEAR]
             .into_iter()
-            .chain([ID_SWITCH_CLEAR, ID_CHECK])
             .map(item),
     );
+    #[cfg(not(feature = "store"))]
+    right.push(item(ID_CHECK));
     right.extend(bar);
     page::anchor(hwnd, by, &right, &wide, &bar);
     view::place_columns(columns.0, columns.1, columns.2);
@@ -539,11 +571,11 @@ fn on_command(id: i32, code: u32) {
         _ if (ID_TAB..ID_TAB + 4).contains(&id) => click_tab(hwnd, (id - ID_TAB) as usize),
         ID_THEME => {
             let Some(btn) = se(|s| s.theme_btn) else { return };
-            let current = app::with(|a| a.config.theme);
-            let items: Vec<String> = Theme::ALL.iter().map(|th| t(th.key())).collect();
-            let checked: Vec<usize> = Theme::ALL.iter().position(|th| *th == current).into_iter().collect();
+            let current = app::with(|a| a.config.theme).effective();
+            let items: Vec<String> = Theme::SELECTABLE.iter().map(|th| t(th.key())).collect();
+            let checked: Vec<usize> = Theme::SELECTABLE.iter().position(|th| *th == current).into_iter().collect();
             if let Some(i) = popup_menu(hwnd, btn, &items, &checked) {
-                if let Err(e) = app::set_theme(Theme::ALL[i]) {
+                if let Err(e) = app::set_theme(Theme::SELECTABLE[i]) {
                     alert(hwnd, &e);
                 }
                 refresh();
@@ -587,12 +619,26 @@ fn on_command(id: i32, code: u32) {
             se(|s| s.switch_info = info);
             invalidate(hwnd);
         }
+        #[cfg(not(feature = "store"))]
         ID_CHECK => check_updates(),
+        #[cfg(feature = "store")]
+        ID_STARTUP_APPS => open_startup_settings(),
         ID_SAVE => save(),
         ID_CLOSE | IDCANCEL_KEY | page::ID_HOME => close(),
         _ if code == EN_SETFOCUS || code == EN_KILLFOCUS => invalidate(hwnd),
         _ => {}
     }
+}
+
+/// Store build: the Run key is not usable inside an MSIX package, so the
+/// autostart switch is replaced by a shortcut to Windows' own startup list.
+/// ShellExecute runs on a worker thread (it may block); it cannot fail for
+/// this built-in URI on supported Windows versions, so the result is ignored.
+#[cfg(feature = "store")]
+fn open_startup_settings() {
+    std::thread::spawn(|| {
+        let _ = crate::win::shell::open("ms-settings:startupapps", "");
+    });
 }
 
 /// A click on a switch row's label toggles its switch (bigger hit area).
@@ -604,6 +650,10 @@ fn on_click(lparam: LPARAM) {
         return;
     }
     let row = ((y - px(SWITCH_Y)) / px(SWITCH_ROW)) as usize;
+    // Store build: row 0 holds the Windows Settings button, not a switch.
+    if cfg!(feature = "store") && row == 0 {
+        return;
+    }
     if let Some(&btn) = toggles.get(row) {
         kit::toggle_animated(btn);
     }

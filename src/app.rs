@@ -22,6 +22,7 @@ use crate::security::dpapi;
 use crate::services::cooldown::Cooldowns;
 use crate::shortcut::{Shortcut, MOD_ALT, MOD_CTRL};
 use crate::ui;
+#[cfg(not(feature = "store"))]
 use crate::update::{self, ReleaseInfo};
 use crate::win::shell::ShellFail;
 use crate::win::{self, context, hook, hotkey, startup, tick, tray, PostTarget, WM_APP_SHOW, WM_APP_TASK};
@@ -100,7 +101,9 @@ pub enum TaskResult {
     Guilds(Result<Vec<Guild>, ApiError>),
     Channels(Result<Vec<Channel>, ApiError>),
     UserInfo(Result<User, ApiError>),
+    #[cfg(not(feature = "store"))]
     UpdateChecked(Result<Option<ReleaseInfo>, String>),
+    #[cfg(not(feature = "store"))]
     UpdateDownloaded(Result<update::Downloaded, String>),
 }
 
@@ -788,7 +791,9 @@ fn on_task(result: TaskResult) {
         TaskResult::Guilds(r) => ui::editor::on_guilds(r),
         TaskResult::Channels(r) => ui::editor::on_channels(r),
         TaskResult::UserInfo(r) => ui::editor::on_user(r),
+        #[cfg(not(feature = "store"))]
         TaskResult::UpdateChecked(r) => ui::settings::on_update_checked(r),
+        #[cfg(not(feature = "store"))]
         TaskResult::UpdateDownloaded(r) => ui::settings::on_update_downloaded(r),
     }
 }
@@ -1029,8 +1034,10 @@ pub fn set_profile_switch(shortcut: Option<Shortcut>) -> Result<u32, String> {
 // ---------- settings ----------
 
 pub fn save_settings(next: Config) -> Result<(), String> {
+    #[cfg(not(feature = "store"))]
     let autostart = next.start_with_windows;
     with(|a| a.commit(next))?;
+    #[cfg(not(feature = "store"))]
     startup::set_enabled(autostart)?;
     after_change();
     Ok(())
@@ -1055,7 +1062,7 @@ pub fn set_theme(theme: Theme) -> Result<(), String> {
 
 /// Re-reads the Windows light/dark setting (WM_SETTINGCHANGE).
 pub fn system_theme_changed() {
-    let theme = with(|a| a.config.theme);
+    let theme = with(|a| a.config.theme).effective();
     if theme == Theme::System && ui::theme::set_theme(theme) {
         ui::repaint_all();
     }
@@ -1102,6 +1109,7 @@ pub fn exit() {
     unsafe { DestroyWindow(host) };
 }
 
+#[cfg(not(feature = "store"))]
 pub fn install_update_and_exit(downloaded: &update::Downloaded) -> Result<(), String> {
     let dir = with(|a| a.dir.clone());
     update::apply_and_restart(downloaded, &dir)?;
@@ -1161,6 +1169,7 @@ pub fn run() -> i32 {
     }
     let dir = config::data_dir();
     let Some(_instance) = single_instance(&dir, has("--updated")) else { return 0 };
+    #[cfg(not(feature = "store"))]
     update::cleanup_old();
 
     let loaded = config::load(&dir, i18n::system_language());
@@ -1173,7 +1182,9 @@ pub fn run() -> i32 {
         None
     });
     let conn = if token.is_some() { Conn::Checking } else { Conn::NoToken };
-    let (launch_minimized, to_tray, autostart) = (config.launch_minimized, config.minimize_to_tray, config.start_with_windows);
+    let (launch_minimized, to_tray) = (config.launch_minimized, config.minimize_to_tray);
+    #[cfg(not(feature = "store"))]
+    let autostart = config.start_with_windows;
     let double_tap = config.double_tap_ms as u64;
 
     APP.with(|a| {
@@ -1226,6 +1237,7 @@ pub fn run() -> i32 {
         }
     });
     tray_tip();
+    #[cfg(not(feature = "store"))]
     if autostart && let Err(e) = startup::set_enabled(true) {
         warnings.push(e);
     }

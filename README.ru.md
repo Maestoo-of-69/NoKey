@@ -121,7 +121,7 @@ Windows 10 / 11, 64 бита. macOS и Linux пока не поддержива�
 `config.json` — обычный текстовый файл: не кладите пароли в тексты для печати.
 Перехватчик клавиатуры держит нажатия только в памяти, чтобы узнавать сочетания.
 В сеть NoKey ходит в Discord (если вы им пользуетесь) и на GitHub (проверка
-обновлений).
+обновлений). Полная политика конфиденциальности: [PRIVACY.md](PRIVACY.md).
 
 ## Сборка и проверки
 
@@ -136,3 +136,9 @@ cargo clippy --all-targets
 Тесты горячих клавиш нажимают F21–F24, поэтому во время них держите впереди обычное
 окно (не запущенное от администратора). Подробнее об устройстве — в
 [README.md](README.md) и [docs/DESIGN.md](docs/DESIGN.md).
+
+**Сборка для Microsoft Store:** `cargo build --release --features store` — без
+встроенного обновления и темы Jewish, автозапуск через startup task пакета
+MSIX вместо ключа Run. Пакет `.msix` / `.msixupload` собирает
+`packaging/store/build-msix.ps1`; пошаговая инструкция —
+[packaging/store/STORE.ru.md](packaging/store/STORE.ru.md).

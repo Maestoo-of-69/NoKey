@@ -530,6 +530,22 @@ pub enum Theme {
 impl Theme {
     pub const ALL: [Theme; 5] = [Theme::Dark, Theme::Light, Theme::Contrast, Theme::System, Theme::Jewish];
 
+    /// Themes the UI offers. The Microsoft Store build omits `Jewish`.
+    #[cfg(not(feature = "store"))]
+    pub const SELECTABLE: [Theme; 5] = Self::ALL;
+    #[cfg(feature = "store")]
+    pub const SELECTABLE: [Theme; 4] = [Theme::Dark, Theme::Light, Theme::Contrast, Theme::System];
+
+    /// The theme actually applied. Configs are shared with the GitHub build, so
+    /// the Store build keeps a saved `Jewish` value on disk but shows `System`.
+    pub fn effective(self) -> Theme {
+        #[cfg(feature = "store")]
+        if self == Theme::Jewish {
+            return Theme::System;
+        }
+        self
+    }
+
     pub fn key(self) -> &'static str {
         match self {
             Theme::Dark => "theme.dark",
@@ -693,6 +709,24 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn store_build_hides_jewish_theme() {
+        assert!(!Theme::SELECTABLE.contains(&Theme::Jewish));
+        assert_eq!(Theme::SELECTABLE.len(), Theme::ALL.len() - 1);
+        assert_eq!(Theme::Jewish.effective(), Theme::System);
+        for th in Theme::SELECTABLE {
+            assert_eq!(th.effective(), th);
+        }
+    }
+
+    #[cfg(not(feature = "store"))]
+    #[test]
+    fn default_build_offers_every_theme() {
+        assert_eq!(Theme::SELECTABLE, Theme::ALL);
+        assert_eq!(Theme::Jewish.effective(), Theme::Jewish);
+    }
 
     #[test]
     fn url_validation() {

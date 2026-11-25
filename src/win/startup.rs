@@ -44,7 +44,16 @@ pub fn is_enabled() -> bool {
     current_value().is_some()
 }
 
+/// Store build: inside an MSIX package HKCU writes go to a private hive, so
+/// the Run key would do nothing. Autostart is the package's `startupTask`,
+/// which the user switches in Windows Settings > Apps > Startup.
+#[cfg(feature = "store")]
+pub fn set_enabled(_enabled: bool) -> Result<(), String> {
+    Ok(())
+}
+
 /// Turns autostart on or off. Also refreshes the path if the exe moved.
+#[cfg(not(feature = "store"))]
 pub fn set_enabled(enabled: bool) -> Result<(), String> {
     let key = wide(RUN_KEY);
     let name = wide(VALUE_NAME);

@@ -165,7 +165,7 @@ pub fn system_uses_light() -> bool {
 }
 
 pub fn palette_for(theme: Theme, system_light: bool) -> Palette {
-    match theme {
+    match theme.effective() {
         Theme::Dark => DARK,
         Theme::Light => LIGHT,
         Theme::Contrast => CONTRAST,
@@ -189,7 +189,7 @@ thread_local! {
 /// Switches the palette (UI thread). Returns true if the colors changed.
 pub fn set_theme(theme: Theme) -> bool {
     let p = palette_for(theme, system_uses_light());
-    THEME.with(|t| t.set(theme));
+    THEME.with(|t| t.set(theme.effective()));
     let changed = PALETTE.with(|c| c.replace(p)) != p || BRUSHES.with(|b| b.get().0 == 0);
     if changed {
         let new = unsafe { (CreateSolidBrush(p.bg) as usize, CreateSolidBrush(p.surface) as usize) };

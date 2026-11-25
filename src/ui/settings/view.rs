@@ -127,6 +127,7 @@ fn create_profiles(hwnd: HWND, hdc: HDC) -> (Vec<HWND>, HWND, HWND, HWND, i32) {
     (group, list, name, record, rec_x - 12 - PAD)
 }
 
+#[cfg(not(feature = "store"))]
 fn create_updates(hwnd: HWND, hdc: HDC) -> (HWND, HWND) {
     let label = t("settings.check_updates");
     let w = btn_w(hdc, &label);
@@ -157,7 +158,16 @@ pub(super) fn on_create(hwnd: HWND) {
     let btn_disconnect = discord[1];
     discord.push(token);
     let (profiles_group, profiles, profile_name, switch_record, shortcut_w) = create_profiles(hwnd, hdc);
+    #[cfg(not(feature = "store"))]
     let (repo, btn_check) = create_updates(hwnd, hdc);
+    // Store build: the first switch row becomes a button to Windows Settings.
+    #[cfg(feature = "store")]
+    let startup_btn = {
+        let label = t("settings.startup_apps");
+        let btn = mk(hwnd, ID_STARTUP_APPS, &label, BTN_SECONDARY, (PAD, SWITCH_Y, btn_w(hdc, &label), SWITCH_ROW));
+        show(toggles[0], false);
+        btn
+    };
     create_bar(hwnd, hdc);
     unsafe { ReleaseDC(hwnd, hdc) };
 
@@ -166,13 +176,34 @@ pub(super) fn on_create(hwnd: HWND) {
     }
     add_tooltip(hwnd, theme_btn, &t("tip.theme"));
     add_tooltip(hwnd, switch_record, &t("tip.profile_switch"));
+    #[cfg(feature = "store")]
+    {
+        add_tooltip(hwnd, startup_btn, &t("tip.startup_apps"));
+        // layout() shows every control of the tab's group: keep the hidden switch out.
+        general.retain(|&c| c != toggles[0]);
+        general.push(startup_btn);
+    }
 
     let mut edits = nums.to_vec();
-    edits.extend([token, profile_name, repo]);
-    let groups = [general, discord, profiles_group, vec![repo, btn_check]];
-    let (tab, profile_ids, recording, switch_info, update_status) = (TAB_GENERAL, Vec::new(), false, String::new(), String::new());
-    let state = Se { hwnd, tab, tabs, groups, edits, theme_btn, language_btn, toggles, nums, token, btn_disconnect, profiles,
-        profile_ids, profile_name, switch_record, shortcut_w, recording, switch_info, repo, btn_check, update_status };
+    edits.extend([token, profile_name]);
+    #[cfg(not(feature = "store"))]
+    edits.push(repo);
+    #[cfg(not(feature = "store"))]
+    let updates_group = vec![repo, btn_check];
+    #[cfg(feature = "store")]
+    let updates_group = Vec::new();
+    let groups = [general, discord, profiles_group, updates_group];
+    let (tab, profile_ids, recording, switch_info) = (TAB_GENERAL, Vec::new(), false, String::new());
+    let state = Se {
+        hwnd, tab, tabs, groups, edits, theme_btn, language_btn, toggles, nums, token, btn_disconnect, profiles,
+        profile_ids, profile_name, switch_record, shortcut_w, recording, switch_info,
+        #[cfg(not(feature = "store"))]
+        repo,
+        #[cfg(not(feature = "store"))]
+        btn_check,
+        #[cfg(not(feature = "store"))]
+        update_status: String::new(),
+    };
     SE.with(|s| *s.borrow_mut() = Some(state));
 }
 
@@ -197,6 +228,9 @@ fn paint_general(hdc: HDC) {
     caption(hdc, &t("settings.language"), PAD + half + 8, TOP, half);
     let label_w = content_w() - SWITCH_BTN_W - 12;
     for (i, key) in TOGGLES.iter().enumerate() {
+        if cfg!(feature = "store") && i == 0 {
+            continue; // replaced by the Windows Settings button
+        }
         let rc = r(PAD, SWITCH_Y + SWITCH_ROW * i as i32, label_w, SWITCH_ROW);
         text(hdc, &t(key), &rc, f.normal, p.text, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
     }
@@ -243,15 +277,19 @@ fn paint_profiles(hdc: HDC, switch_info: &str, recording: bool, shortcut_w: i32)
     text(hdc, switch_info, &r(PAD, TOP + 364, content_w(), 36), f.small, p.muted, DT_WORDBREAK | DT_END_ELLIPSIS);
 }
 
-fn paint_updates(hdc: HDC, status: &str) {
+fn paint_updates(hdc: HDC, #[cfg(not(feature = "store"))] status: &str) {
     let p = palette();
     let f = fonts();
     caption(hdc, &t("settings.updates"), PAD, TOP, content_w());
     let ver = tf("settings.installed_version", &[("version", CURRENT_VERSION)]);
     text(hdc, &ver, &r(PAD, TOP + 24, content_w(), 20), f.normal, p.text, DT_SINGLELINE | DT_END_ELLIPSIS);
-    caption(hdc, &t("settings.repo"), PAD, TOP + 68, content_w());
-    text(hdc, status, &r(PAD, TOP + 144, content_w(), 36), f.small, p.text, DT_WORDBREAK | DT_END_ELLIPSIS);
-    text(hdc, &t("settings.update_help"), &r(PAD, TOP + 188, content_w(), 48), f.small, p.muted, DT_WORDBREAK | DT_END_ELLIPSIS);
+    // Store build: the Store delivers updates, only the version is shown.
+    #[cfg(not(feature = "store"))]
+    {
+        caption(hdc, &t("settings.repo"), PAD, TOP + 68, content_w());
+        text(hdc, status, &r(PAD, TOP + 144, content_w(), 36), f.small, p.text, DT_WORDBREAK | DT_END_ELLIPSIS);
+        text(hdc, &t("settings.update_help"), &r(PAD, TOP + 188, content_w(), 48), f.small, p.muted, DT_WORDBREAK | DT_END_ELLIPSIS);
+    }
 }
 
 /// Header bar with the title, the hairline under the tabs and the action bar line.
@@ -262,11 +300,13 @@ fn paint_chrome(hdc: HDC, hwnd: HWND) {
 }
 
 pub(super) fn on_paint(hwnd: HWND) {
-    let Some((tab, tabs, edits, status, switch_info, recording, shortcut_w)) = se(|s| {
-        (s.tab, s.tabs, s.edits.clone(), s.update_status.clone(), s.switch_info.clone(), s.recording, s.shortcut_w)
-    }) else {
+    let Some((tab, tabs, edits, switch_info, recording, shortcut_w)) =
+        se(|s| (s.tab, s.tabs, s.edits.clone(), s.switch_info.clone(), s.recording, s.shortcut_w))
+    else {
         return;
     };
+    #[cfg(not(feature = "store"))]
+    let status = se(|s| s.update_status.clone()).unwrap_or_default();
     let checking = tab == TAB_DISCORD && app::with(|a| matches!(a.conn, Conn::Checking));
     // Each pulse frame repaints only the dot (centered at PAD + 4, TOP + 36).
     let dot_area = r(PAD - 2, TOP + 30, 12, 12);
@@ -279,7 +319,7 @@ pub(super) fn on_paint(hwnd: HWND) {
             TAB_GENERAL => paint_general(hdc),
             TAB_DISCORD => paint_discord(hdc, dot_pulse),
             TAB_PROFILES => paint_profiles(hdc, &switch_info, recording, shortcut_w),
-            _ => paint_updates(hdc, &status),
+            _ => paint_updates(hdc, #[cfg(not(feature = "store"))] &status),
         }
     });
 }

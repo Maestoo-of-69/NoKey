@@ -156,6 +156,7 @@ NoKey holds that key only while the binding is typing or repeating.
 keyboard hook keeps keystrokes in memory only to match shortcuts. Network
 requests go to Discord (when you use it) and to GitHub (when you check for
 updates). `NOKEY_DATA_DIR` moves the data folder (portable use, tests).
+Full privacy policy: [PRIVACY.md](PRIVACY.md).
 
 ## Known limitations
 
@@ -182,6 +183,11 @@ cargo clippy --all-targets
 The hotkey tests inject F21–F24 with `SendInput`, so keep a normal window (not
 an administrator one) in front while they run. Live Discord tests are ignored
 by default (`tests/discord_live.rs`).
+
+**Microsoft Store build:** `cargo build --release --features store` turns off
+the built-in updater, leaves out the Jewish theme and uses the MSIX startup task instead of the Run key.
+`packaging/store/build-msix.ps1` builds the `.msix` / `.msixupload`; the steps
+are in [packaging/store/STORE.ru.md](packaging/store/STORE.ru.md).
 
 ## Architecture
 
